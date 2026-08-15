@@ -1,0 +1,27 @@
+# Configuração padrão do trackingCorporal.
+# Os valores serão definidos e ajustados quando a implementação começar.
+
+camera:
+  device_index: 0
+  width: 640
+  height: 480
+  fps: 30
+
+pose:
+  input_width: 256
+  input_height: 256
+  keypoint_count: 17
+
+tracking:
+  smoothing_enabled: true
+
+hands:
+  enabled: true
+  states:
+    - OPEN
+    - CLOSED
+    - UNKNOWN
+
+visualization:
+  show_fps: true
+  show_skeleton: true
