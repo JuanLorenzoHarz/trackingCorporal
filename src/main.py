@@ -18,8 +18,8 @@ from src.visualization.renderer import draw_pose
 
 WINDOW_NAME = "trackingCorporal"
 CAMERA_INDEX = 0
-REQUESTED_WIDTH = 1280
-REQUESTED_HEIGHT = 720
+REQUESTED_WIDTH = 640
+REQUESTED_HEIGHT = 480
 
 
 def draw_status(frame: np.ndarray, fps: float) -> np.ndarray:
