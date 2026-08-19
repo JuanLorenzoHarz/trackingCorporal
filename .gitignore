@@ -16,6 +16,7 @@ Thumbs.db
 # Local data and generated artifacts
 data/raw/*
 data/processed/*
+data/coco/
 models/*
 
 # Keep directory placeholders
