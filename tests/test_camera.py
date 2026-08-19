@@ -2,6 +2,7 @@
 
 from unittest.mock import MagicMock, patch
 
+import cv2
 import numpy as np
 import pytest
 
@@ -19,8 +20,8 @@ def test_camera_opens_and_releases(mock_video_capture):
         assert camera.is_opened()
         assert camera.resolution == (1280, 720)
 
-    capture.set.assert_any_call(3, 1280)
-    capture.set.assert_any_call(4, 720)
+    capture.set.assert_any_call(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+    capture.set.assert_any_call(cv2.CAP_PROP_FRAME_HEIGHT, 720)
     capture.release.assert_called_once()
 
 
