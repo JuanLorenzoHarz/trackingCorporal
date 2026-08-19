@@ -6,7 +6,9 @@ Projeto experimental de tracking corporal 2D em tempo real a partir de vídeo de
 
 **WIP — Fase 1.**
 
-A estrutura inicial já está preparada e a definição básica do esqueleto corporal já foi implementada. O projeto ainda não faz pose estimation real: por enquanto já existem os 17 keypoints, conexões do esqueleto, tipos compartilhados, renderer básico e um demo artificial que funciona sem webcam.
+A estrutura inicial já está preparada. O projeto já possui os 17 keypoints, conexões do esqueleto, tipos compartilhados, renderer básico, captura de webcam e um loop de vídeo ao vivo.
+
+A pose exibida sobre a webcam ainda é artificial e fixa: ainda não existe pose estimation real.
 
 ## Escopo inicial
 
@@ -48,9 +50,30 @@ webcam
   -> visualização
 ```
 
-## O que já funciona sem webcam
+## Webcam ao vivo — etapa atual
 
-O projeto já consegue representar uma pose artificial com 17 keypoints e desenhar suas conexões em uma imagem usando OpenCV.
+Com uma webcam disponível, execute:
+
+```powershell
+python -m src.main
+```
+
+O programa atualmente:
+
+- abre a câmera de índice `0`;
+- solicita captura em `640x480`;
+- mostra os frames em tempo real;
+- exibe FPS aproximado;
+- desenha uma pose artificial fixa sobre o vídeo;
+- mostra `POSE DEMO - NOT TRACKING` para deixar claro que o corpo ainda não está sendo detectado;
+- encerra com `Q` ou `ESC`;
+- libera a câmera ao terminar.
+
+A etapa seguinte substituirá a pose artificial por coordenadas produzidas pelo pipeline de pose estimation.
+
+## Demo sem webcam
+
+O projeto também consegue representar uma pose artificial com 17 keypoints e desenhar suas conexões em uma imagem usando OpenCV.
 
 Para gerar uma imagem de demonstração:
 
@@ -70,11 +93,15 @@ Para gerar e também abrir a imagem em uma janela:
 python -m scripts.demo_skeleton --show
 ```
 
+## Testes
+
 Para executar os testes atuais:
 
 ```powershell
 python -m pytest -v
 ```
+
+Os testes de `Camera` usam mocks e não exigem uma webcam física.
 
 ## Estrutura
 
