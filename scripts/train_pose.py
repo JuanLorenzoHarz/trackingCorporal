@@ -10,6 +10,10 @@ Exemplos:
     # Continua a partir de um checkpoint existente.
     python -m scripts.train_pose --resume models/pose_model.pt \
         --max-hours 6 --epochs 0 --batch-size 8
+
+    # Refinamento específico para oclusões artificiais.
+    python -m scripts.train_pose --resume models/pose_model.pt \
+        --max-hours 3 --epochs 0 --occlusion-probability 0.35
 """
 
 from __future__ import annotations
@@ -99,8 +103,6 @@ def load_checkpoint_for_training(
     optimizer_state = checkpoint.get("optimizer_state")
     if optimizer_state is not None:
         optimizer.load_state_dict(optimizer_state)
-        # O argumento da linha de comando continua sendo a fonte de verdade
-        # para a taxa de aprendizado da nova sessão.
         for parameter_group in optimizer.param_groups:
             parameter_group["lr"] = learning_rate
         print("Estado do otimizador restaurado do checkpoint.")
@@ -140,8 +142,19 @@ def train(args: argparse.Namespace) -> None:
         sigma=args.sigma,
         min_keypoints=args.min_keypoints,
         max_samples=args.max_samples,
+        occlusion_probability=args.occlusion_probability,
+        occlusion_min_size=args.occlusion_min_size,
+        occlusion_max_size=args.occlusion_max_size,
+        augmentation_seed=args.augmentation_seed,
     )
     print(f"Exemplos de pessoas carregados: {len(dataset)}")
+
+    if args.occlusion_probability > 0.0:
+        print(
+            "Oclusão artificial ativa: "
+            f"probabilidade {args.occlusion_probability:.2f}, "
+            f"tamanho {args.occlusion_min_size:.2f}-{args.occlusion_max_size:.2f} do recorte."
+        )
 
     loader = DataLoader(
         dataset,
@@ -339,6 +352,30 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help="Limita exemplos para testes rápidos. Omitido = usa todos os exemplos disponíveis.",
+    )
+    parser.add_argument(
+        "--occlusion-probability",
+        type=float,
+        default=0.0,
+        help="Chance de esconder artificialmente uma região de cada pessoa durante o treino.",
+    )
+    parser.add_argument(
+        "--occlusion-min-size",
+        type=float,
+        default=0.12,
+        help="Menor lado relativo do retângulo de oclusão.",
+    )
+    parser.add_argument(
+        "--occlusion-max-size",
+        type=float,
+        default=0.35,
+        help="Maior lado relativo do retângulo de oclusão.",
+    )
+    parser.add_argument(
+        "--augmentation-seed",
+        type=int,
+        default=None,
+        help="Seed opcional para reproduzir as oclusões artificiais.",
     )
     parser.add_argument("--log-every", type=int, default=20)
     return parser.parse_args()
