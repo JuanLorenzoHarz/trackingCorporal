@@ -6,6 +6,10 @@ Exemplos:
 
     # Treino controlado por tempo: roda por até 8 horas.
     python -m scripts.train_pose --max-hours 8 --epochs 0 --batch-size 4
+
+    # Continua a partir de um checkpoint existente.
+    python -m scripts.train_pose --resume models/pose_model.pt \
+        --max-hours 6 --epochs 0 --batch-size 8
 """
 
 from __future__ import annotations
@@ -45,6 +49,80 @@ def format_duration(seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
 
+def load_checkpoint_for_training(
+    checkpoint_path: str | Path,
+    model: PoseNet,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+    expected_input_size: int,
+    expected_heatmap_size: int,
+    learning_rate: float,
+) -> tuple[int, int]:
+    """Carrega pesos e, quando disponível, estado do otimizador.
+
+    Checkpoints antigos do projeto não possuíam ``optimizer_state``. Nesse caso
+    os pesos da CNN continuam normalmente, mas o Adam começa com estado novo.
+
+    Retorna ``(epoch, global_step)`` registrados no checkpoint.
+    """
+    path = Path(checkpoint_path)
+    if not path.is_file():
+        raise FileNotFoundError(f"Checkpoint para continuar não encontrado: {path}")
+
+    checkpoint = torch.load(path, map_location=device, weights_only=True)
+    if not isinstance(checkpoint, dict) or "model_state" not in checkpoint:
+        raise RuntimeError("Checkpoint inválido: model_state não encontrado.")
+
+    keypoint_count = int(checkpoint.get("keypoint_count", NUM_KEYPOINTS))
+    if keypoint_count != NUM_KEYPOINTS:
+        raise RuntimeError(
+            f"Checkpoint possui {keypoint_count} keypoints; esperados {NUM_KEYPOINTS}."
+        )
+
+    checkpoint_input_size = int(checkpoint.get("input_size", expected_input_size))
+    checkpoint_heatmap_size = int(
+        checkpoint.get("heatmap_size", expected_heatmap_size)
+    )
+    if checkpoint_input_size != expected_input_size:
+        raise RuntimeError(
+            "O input-size do checkpoint não corresponde ao treino atual: "
+            f"{checkpoint_input_size} != {expected_input_size}."
+        )
+    if checkpoint_heatmap_size != expected_heatmap_size:
+        raise RuntimeError(
+            "O heatmap-size do checkpoint não corresponde ao treino atual: "
+            f"{checkpoint_heatmap_size} != {expected_heatmap_size}."
+        )
+
+    model.load_state_dict(checkpoint["model_state"])
+
+    optimizer_state = checkpoint.get("optimizer_state")
+    if optimizer_state is not None:
+        optimizer.load_state_dict(optimizer_state)
+        # O argumento da linha de comando continua sendo a fonte de verdade
+        # para a taxa de aprendizado da nova sessão.
+        for parameter_group in optimizer.param_groups:
+            parameter_group["lr"] = learning_rate
+        print("Estado do otimizador restaurado do checkpoint.")
+    else:
+        print(
+            "Checkpoint antigo sem estado do otimizador: "
+            "pesos restaurados e Adam reiniciado."
+        )
+
+    saved_epoch = int(checkpoint.get("epoch", 0))
+    saved_global_step = int(checkpoint.get("global_step", 0))
+    saved_batch = int(checkpoint.get("batch_index", 0))
+
+    print(f"Continuando de: {path.resolve()}")
+    print(
+        f"Checkpoint anterior: epoch {saved_epoch}, "
+        f"batch {saved_batch}, global_step {saved_global_step}."
+    )
+
+    return saved_epoch, saved_global_step
+
+
 def train(args: argparse.Namespace) -> None:
     if args.epochs <= 0 and args.max_hours is None:
         raise ValueError("Use --epochs maior que 0 ou informe --max-hours.")
@@ -76,25 +154,37 @@ def train(args: argparse.Namespace) -> None:
     model = PoseNet().to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
 
+    global_step = 0
+    completed_epoch = 0
+    if args.resume is not None:
+        completed_epoch, global_step = load_checkpoint_for_training(
+            checkpoint_path=args.resume,
+            model=model,
+            optimizer=optimizer,
+            device=device,
+            expected_input_size=args.input_size,
+            expected_heatmap_size=args.heatmap_size,
+            learning_rate=args.learning_rate,
+        )
+
     training_started = time.perf_counter()
     max_seconds = args.max_hours * 3600.0 if args.max_hours is not None else None
-    global_step = 0
-    epoch = 0
+    session_epoch = 0
+    current_epoch = completed_epoch
 
     if max_seconds is not None:
         print(
-            "Limite de tempo: "
+            "Limite de tempo desta sessão: "
             f"{format_duration(max_seconds)}. O modelo será salvo antes de encerrar."
         )
 
     try:
         while True:
-            epoch += 1
-
-            # epochs=0 significa sem limite de épocas; --max-hours controla a parada.
-            if args.epochs > 0 and epoch > args.epochs:
+            session_epoch += 1
+            if args.epochs > 0 and session_epoch > args.epochs:
                 break
 
+            current_epoch += 1
             model.train()
             running_loss = 0.0
 
@@ -115,9 +205,10 @@ def train(args: argparse.Namespace) -> None:
 
                 if batch_index % args.log_every == 0 or batch_index == len(loader):
                     average = running_loss / batch_index
-                    epoch_limit = str(args.epochs) if args.epochs > 0 else "sem-limite"
+                    session_limit = str(args.epochs) if args.epochs > 0 else "sem-limite"
                     message = (
-                        f"epoch {epoch:02d}/{epoch_limit} | "
+                        f"epoch total {current_epoch:02d} | "
+                        f"sessao {session_epoch:02d}/{session_limit} | "
                         f"batch {batch_index:04d}/{len(loader):04d} | "
                         f"loss {average:.6f} | "
                         f"tempo {format_duration(elapsed)}"
@@ -131,11 +222,12 @@ def train(args: argparse.Namespace) -> None:
 
                 if max_seconds is not None and elapsed >= max_seconds:
                     save_checkpoint(
-                        model,
-                        args.output,
+                        model=model,
+                        optimizer=optimizer,
+                        output_path=args.output,
                         input_size=args.input_size,
                         heatmap_size=args.heatmap_size,
-                        epoch=epoch,
+                        epoch=current_epoch,
                         batch_index=batch_index,
                         global_step=global_step,
                     )
@@ -146,22 +238,24 @@ def train(args: argparse.Namespace) -> None:
                     return
 
             save_checkpoint(
-                model,
-                args.output,
+                model=model,
+                optimizer=optimizer,
+                output_path=args.output,
                 input_size=args.input_size,
                 heatmap_size=args.heatmap_size,
-                epoch=epoch,
+                epoch=current_epoch,
                 batch_index=len(loader),
                 global_step=global_step,
             )
 
     except KeyboardInterrupt:
         save_checkpoint(
-            model,
-            args.output,
+            model=model,
+            optimizer=optimizer,
+            output_path=args.output,
             input_size=args.input_size,
             heatmap_size=args.heatmap_size,
-            epoch=epoch,
+            epoch=current_epoch,
             batch_index=0,
             global_step=global_step,
         )
@@ -176,6 +270,7 @@ def train(args: argparse.Namespace) -> None:
 
 def save_checkpoint(
     model: PoseNet,
+    optimizer: torch.optim.Optimizer,
     output_path: str | Path,
     input_size: int,
     heatmap_size: int,
@@ -183,12 +278,14 @@ def save_checkpoint(
     batch_index: int = 0,
     global_step: int = 0,
 ) -> None:
+    """Salva pesos e estado de treino para permitir continuação posterior."""
     path = Path(output_path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
     torch.save(
         {
             "model_state": model.state_dict(),
+            "optimizer_state": optimizer.state_dict(),
             "input_size": input_size,
             "heatmap_size": heatmap_size,
             "keypoint_count": NUM_KEYPOINTS,
@@ -208,6 +305,11 @@ def parse_args() -> argparse.Namespace:
         default="data/coco/annotations/person_keypoints_train2017.json",
     )
     parser.add_argument("--output", default="models/pose_model.pt")
+    parser.add_argument(
+        "--resume",
+        default=None,
+        help="Checkpoint existente cujos pesos devem ser usados para continuar o treino.",
+    )
     parser.add_argument("--input-size", type=int, default=256)
     parser.add_argument("--heatmap-size", type=int, default=64)
     parser.add_argument("--sigma", type=float, default=1.8)
@@ -217,13 +319,13 @@ def parse_args() -> argparse.Namespace:
         "--epochs",
         type=int,
         default=10,
-        help="Quantidade máxima de épocas. Use 0 para deixar --max-hours controlar o treino.",
+        help="Quantidade máxima de épocas desta sessão. Use 0 para deixar --max-hours controlar.",
     )
     parser.add_argument(
         "--max-hours",
         type=float,
         default=None,
-        help="Encerra o treino após aproximadamente esta quantidade de horas e salva o checkpoint.",
+        help="Encerra esta sessão após aproximadamente esta quantidade de horas e salva o checkpoint.",
     )
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument(
