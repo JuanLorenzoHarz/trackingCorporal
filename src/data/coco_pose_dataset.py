@@ -4,6 +4,10 @@ O loader lê diretamente o JSON oficial de keypoints do COCO, sem depender de
 um detector de pose pronto ou de pycocotools. Cada anotação de pessoa vira um
 exemplo independente: a pessoa é recortada pela bounding box, centralizada em
 um quadrado e redimensionada para a entrada da CNN.
+
+Opcionalmente, retângulos de oclusão artificial podem ser aplicados à imagem
+sem remover os targets dos keypoints. Isso ensina a CNN a inferir articulações
+mesmo quando os pixels daquela região estão temporariamente escondidos.
 """
 
 from __future__ import annotations
@@ -33,6 +37,10 @@ class CocoPoseDataset(Dataset):
         crop_margin: float = 0.15,
         min_keypoints: int = 5,
         max_samples: int | None = None,
+        occlusion_probability: float = 0.0,
+        occlusion_min_size: float = 0.12,
+        occlusion_max_size: float = 0.35,
+        augmentation_seed: int | None = None,
     ) -> None:
         self.images_dir = Path(images_dir)
         self.annotations_file = Path(annotations_file)
@@ -40,6 +48,18 @@ class CocoPoseDataset(Dataset):
         self.heatmap_size = heatmap_size
         self.sigma = sigma
         self.crop_margin = crop_margin
+        self.occlusion_probability = occlusion_probability
+        self.occlusion_min_size = occlusion_min_size
+        self.occlusion_max_size = occlusion_max_size
+        self._rng = np.random.default_rng(augmentation_seed)
+
+        if not 0.0 <= occlusion_probability <= 1.0:
+            raise ValueError("occlusion_probability deve estar entre 0 e 1.")
+        if not 0.0 < occlusion_min_size <= occlusion_max_size <= 1.0:
+            raise ValueError(
+                "occlusion_min_size e occlusion_max_size devem satisfazer "
+                "0 < min <= max <= 1."
+            )
 
         if not self.images_dir.is_dir():
             raise FileNotFoundError(
@@ -113,6 +133,8 @@ class CocoPoseDataset(Dataset):
             keypoints,
         )
 
+        crop = self._apply_random_occlusion(crop)
+
         rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
         image_tensor = (
             torch.from_numpy(np.ascontiguousarray(rgb))
@@ -133,6 +155,52 @@ class CocoPoseDataset(Dataset):
         visibility_mask = visibility_tensor.view(NUM_KEYPOINTS, 1, 1)
 
         return image_tensor, heatmaps, visibility_mask
+
+    def _apply_random_occlusion(self, image: np.ndarray) -> np.ndarray:
+        """Esconde uma região aleatória sem alterar os targets de pose."""
+        if self.occlusion_probability <= 0.0:
+            return image
+        if self._rng.random() > self.occlusion_probability:
+            return image
+
+        height, width = image.shape[:2]
+        occlusion_width = max(
+            1,
+            int(
+                round(
+                    width
+                    * self._rng.uniform(
+                        self.occlusion_min_size,
+                        self.occlusion_max_size,
+                    )
+                )
+            ),
+        )
+        occlusion_height = max(
+            1,
+            int(
+                round(
+                    height
+                    * self._rng.uniform(
+                        self.occlusion_min_size,
+                        self.occlusion_max_size,
+                    )
+                )
+            ),
+        )
+
+        max_x = max(0, width - occlusion_width)
+        max_y = max(0, height - occlusion_height)
+        left = int(self._rng.integers(0, max_x + 1)) if max_x > 0 else 0
+        top = int(self._rng.integers(0, max_y + 1)) if max_y > 0 else 0
+
+        fill = self._rng.integers(0, 256, size=3, dtype=np.uint8)
+        result = image.copy()
+        result[
+            top : top + occlusion_height,
+            left : left + occlusion_width,
+        ] = fill
+        return result
 
     def _crop_person(
         self,
