@@ -115,7 +115,7 @@ def train(args: argparse.Namespace) -> None:
 
                 if batch_index % args.log_every == 0 or batch_index == len(loader):
                     average = running_loss / batch_index
-                    epoch_limit = str(args.epochs) if args.epochs > 0 else "∞"
+                    epoch_limit = str(args.epochs) if args.epochs > 0 else "sem-limite"
                     message = (
                         f"epoch {epoch:02d}/{epoch_limit} | "
                         f"batch {batch_index:04d}/{len(loader):04d} | "
