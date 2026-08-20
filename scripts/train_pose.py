@@ -1,13 +1,17 @@
 """Treinamento da primeira CNN de pose do trackingCorporal.
 
-Exemplo:
+Exemplos:
     python -m scripts.train_pose --images data/coco/train2017 \
         --annotations data/coco/annotations/person_keypoints_train2017.json
+
+    # Treino controlado por tempo: roda por até 8 horas.
+    python -m scripts.train_pose --max-hours 8 --epochs 0 --batch-size 4
 """
 
 from __future__ import annotations
 
 import argparse
+import time
 from pathlib import Path
 
 import torch
@@ -33,7 +37,20 @@ def masked_heatmap_loss(
     return weighted.sum() / (visible_points * pixels_per_heatmap)
 
 
+def format_duration(seconds: float) -> str:
+    """Formata segundos como HH:MM:SS para os logs de treinamento."""
+    total_seconds = max(0, int(seconds))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
 def train(args: argparse.Namespace) -> None:
+    if args.epochs <= 0 and args.max_hours is None:
+        raise ValueError("Use --epochs maior que 0 ou informe --max-hours.")
+    if args.max_hours is not None and args.max_hours <= 0:
+        raise ValueError("--max-hours deve ser maior que zero.")
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Dispositivo de treino: {device}")
 
@@ -59,38 +76,100 @@ def train(args: argparse.Namespace) -> None:
     model = PoseNet().to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
 
-    for epoch in range(1, args.epochs + 1):
-        model.train()
-        running_loss = 0.0
+    training_started = time.perf_counter()
+    max_seconds = args.max_hours * 3600.0 if args.max_hours is not None else None
+    global_step = 0
+    epoch = 0
 
-        for batch_index, (images, targets, visibility) in enumerate(loader, start=1):
-            images = images.to(device, non_blocking=True)
-            targets = targets.to(device, non_blocking=True)
-            visibility = visibility.to(device, non_blocking=True)
+    if max_seconds is not None:
+        print(
+            "Limite de tempo: "
+            f"{format_duration(max_seconds)}. O modelo será salvo antes de encerrar."
+        )
 
-            optimizer.zero_grad(set_to_none=True)
-            prediction = model(images)
-            loss = masked_heatmap_loss(prediction, targets, visibility)
-            loss.backward()
-            optimizer.step()
+    try:
+        while True:
+            epoch += 1
 
-            running_loss += float(loss.item())
+            # epochs=0 significa sem limite de épocas; --max-hours controla a parada.
+            if args.epochs > 0 and epoch > args.epochs:
+                break
 
-            if batch_index % args.log_every == 0 or batch_index == len(loader):
-                average = running_loss / batch_index
-                print(
-                    f"epoch {epoch:02d}/{args.epochs:02d} | "
-                    f"batch {batch_index:04d}/{len(loader):04d} | "
-                    f"loss {average:.6f}"
-                )
+            model.train()
+            running_loss = 0.0
 
+            for batch_index, (images, targets, visibility) in enumerate(loader, start=1):
+                images = images.to(device, non_blocking=True)
+                targets = targets.to(device, non_blocking=True)
+                visibility = visibility.to(device, non_blocking=True)
+
+                optimizer.zero_grad(set_to_none=True)
+                prediction = model(images)
+                loss = masked_heatmap_loss(prediction, targets, visibility)
+                loss.backward()
+                optimizer.step()
+
+                global_step += 1
+                running_loss += float(loss.item())
+                elapsed = time.perf_counter() - training_started
+
+                if batch_index % args.log_every == 0 or batch_index == len(loader):
+                    average = running_loss / batch_index
+                    epoch_limit = str(args.epochs) if args.epochs > 0 else "∞"
+                    message = (
+                        f"epoch {epoch:02d}/{epoch_limit} | "
+                        f"batch {batch_index:04d}/{len(loader):04d} | "
+                        f"loss {average:.6f} | "
+                        f"tempo {format_duration(elapsed)}"
+                    )
+
+                    if max_seconds is not None:
+                        remaining = max(0.0, max_seconds - elapsed)
+                        message += f" | restante {format_duration(remaining)}"
+
+                    print(message)
+
+                if max_seconds is not None and elapsed >= max_seconds:
+                    save_checkpoint(
+                        model,
+                        args.output,
+                        input_size=args.input_size,
+                        heatmap_size=args.heatmap_size,
+                        epoch=epoch,
+                        batch_index=batch_index,
+                        global_step=global_step,
+                    )
+                    print(
+                        "Limite de tempo atingido. "
+                        f"Checkpoint salvo em: {Path(args.output).resolve()}"
+                    )
+                    return
+
+            save_checkpoint(
+                model,
+                args.output,
+                input_size=args.input_size,
+                heatmap_size=args.heatmap_size,
+                epoch=epoch,
+                batch_index=len(loader),
+                global_step=global_step,
+            )
+
+    except KeyboardInterrupt:
         save_checkpoint(
             model,
             args.output,
             input_size=args.input_size,
             heatmap_size=args.heatmap_size,
             epoch=epoch,
+            batch_index=0,
+            global_step=global_step,
         )
+        print(
+            "Treinamento interrompido pelo usuário. "
+            f"Checkpoint salvo em: {Path(args.output).resolve()}"
+        )
+        return
 
     print(f"Modelo salvo em: {Path(args.output).resolve()}")
 
@@ -101,6 +180,8 @@ def save_checkpoint(
     input_size: int,
     heatmap_size: int,
     epoch: int,
+    batch_index: int = 0,
+    global_step: int = 0,
 ) -> None:
     path = Path(output_path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -112,6 +193,8 @@ def save_checkpoint(
             "heatmap_size": heatmap_size,
             "keypoint_count": NUM_KEYPOINTS,
             "epoch": epoch,
+            "batch_index": batch_index,
+            "global_step": global_step,
         },
         path,
     )
@@ -130,7 +213,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sigma", type=float, default=1.8)
     parser.add_argument("--min-keypoints", type=int, default=5)
     parser.add_argument("--batch-size", type=int, default=16)
-    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=10,
+        help="Quantidade máxima de épocas. Use 0 para deixar --max-hours controlar o treino.",
+    )
+    parser.add_argument(
+        "--max-hours",
+        type=float,
+        default=None,
+        help="Encerra o treino após aproximadamente esta quantidade de horas e salva o checkpoint.",
+    )
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument(
         "--workers",
@@ -142,7 +236,7 @@ def parse_args() -> argparse.Namespace:
         "--max-samples",
         type=int,
         default=None,
-        help="Limita exemplos para testes rápidos do pipeline.",
+        help="Limita exemplos para testes rápidos. Omitido = usa todos os exemplos disponíveis.",
     )
     parser.add_argument("--log-every", type=int, default=20)
     return parser.parse_args()
