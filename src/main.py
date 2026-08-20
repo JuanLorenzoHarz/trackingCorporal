@@ -149,10 +149,12 @@ def main(args: argparse.Namespace | None = None) -> None:
             "Tracking temporal ativo: keypoints ocultos podem ser previstos por poucos frames."
         )
         print(
-            f"Previsão: até {args.prediction_frames} frames | "
+            f"Detecção mínima {args.confidence:.2f} | "
+            f"render mínimo {args.render_confidence:.2f} | "
+            f"previsão até {args.prediction_frames} frames | "
             f"decay {args.prediction_decay:.2f} | "
             f"peso anatômico {args.anatomy_weight:.2f} | "
-            f"smoothing {args.smoothing_alpha:.2f}."
+            f"Smoothing {args.smoothing_alpha:.2f}."
         )
 
     previous_time = time.perf_counter()
@@ -198,7 +200,7 @@ def main(args: argparse.Namespace | None = None) -> None:
                     draw_pose(
                         frame,
                         pose,
-                        confidence_threshold=args.confidence,
+                        confidence_threshold=args.render_confidence,
                     )
                 else:
                     assert demo_pose is not None
@@ -241,6 +243,12 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.15,
         help="Confiança mínima para uma observação da CNN ser considerada real.",
+    )
+    parser.add_argument(
+        "--render-confidence",
+        type=float,
+        default=0.05,
+        help="Confiança mínima para desenhar a pose final, incluindo previsões em decay.",
     )
     parser.add_argument("--camera", type=int, default=CAMERA_INDEX)
     parser.add_argument(
