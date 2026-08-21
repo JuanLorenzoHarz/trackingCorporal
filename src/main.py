@@ -39,6 +39,7 @@ def draw_status(
     mode: str,
     predicted_count: int = 0,
     plausibility_percentage: float = 100.0,
+    leg_plausibility_percentage: float = 100.0,
     rejected_count: int = 0,
     calibrated_segments: int = 0,
 ) -> np.ndarray:
@@ -73,6 +74,7 @@ def draw_status(
     if mode == "model":
         lines = (
             f"Plausibilidade: {plausibility_percentage:.0f}%",
+            f"Pernas: {leg_plausibility_percentage:.0f}%",
             f"Keypoints rejeitados: {rejected_count}",
             f"Keypoints previstos: {predicted_count}",
             f"Calibracao anatomica: {calibrated_segments}/12",
@@ -205,6 +207,7 @@ def main(args: argparse.Namespace | None = None) -> None:
                 frame = camera.read()
                 predicted_count = 0
                 plausibility_percentage = 100.0
+                leg_plausibility_percentage = 100.0
                 rejected_count = 0
                 calibrated_segments = 0
 
@@ -232,6 +235,7 @@ def main(args: argparse.Namespace | None = None) -> None:
 
                     predicted_count = tracker.predicted_count
                     plausibility_percentage = report.percentage
+                    leg_plausibility_percentage = report.leg_percentage
                     rejected_count = len(report.suspicious_indices)
                     calibrated_segments = report.calibrated_segments
 
@@ -255,6 +259,7 @@ def main(args: argparse.Namespace | None = None) -> None:
                     args.mode,
                     predicted_count=predicted_count,
                     plausibility_percentage=plausibility_percentage,
+                    leg_plausibility_percentage=leg_plausibility_percentage,
                     rejected_count=rejected_count,
                     calibrated_segments=calibrated_segments,
                 )
