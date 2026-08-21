@@ -48,6 +48,14 @@ STRUCTURAL_SEGMENTS: tuple[Segment, ...] = (
 )
 
 
+LEG_SEGMENTS: tuple[Segment, ...] = (
+    _segment(BodyKeypoint.LEFT_HIP, BodyKeypoint.LEFT_KNEE),
+    _segment(BodyKeypoint.LEFT_KNEE, BodyKeypoint.LEFT_ANKLE),
+    _segment(BodyKeypoint.RIGHT_HIP, BodyKeypoint.RIGHT_KNEE),
+    _segment(BodyKeypoint.RIGHT_KNEE, BodyKeypoint.RIGHT_ANKLE),
+)
+
+
 SYMMETRY_PAIRS: tuple[tuple[Segment, Segment], ...] = (
     (
         _segment(BodyKeypoint.LEFT_SHOULDER, BodyKeypoint.LEFT_ELBOW),
@@ -84,6 +92,7 @@ class PlausibilityReport:
 
     score: float
     bone_score: float
+    leg_score: float
     symmetry_score: float
     temporal_score: float
     suspicious_indices: frozenset[int]
@@ -92,6 +101,10 @@ class PlausibilityReport:
     @property
     def percentage(self) -> float:
         return self.score * 100.0
+
+    @property
+    def leg_percentage(self) -> float:
+        return self.leg_score * 100.0
 
 
 class PosePlausibilityEvaluator:
@@ -218,6 +231,12 @@ class PosePlausibilityEvaluator:
                     suspicious.add(end)
 
         bone_score = mean(segment_scores.values()) if segment_scores else 1.0
+        leg_values = [
+            segment_scores[segment]
+            for segment in LEG_SEGMENTS
+            if segment in segment_scores
+        ]
+        leg_score = mean(leg_values) if leg_values else 1.0
         symmetry_score = mean(symmetry_scores) if symmetry_scores else 1.0
         valid_temporal_scores = [
             temporal_scores[index]
@@ -254,6 +273,7 @@ class PosePlausibilityEvaluator:
         report = PlausibilityReport(
             score=overall,
             bone_score=bone_score,
+            leg_score=leg_score,
             symmetry_score=symmetry_score,
             temporal_score=temporal_score,
             suspicious_indices=frozenset(suspicious),
