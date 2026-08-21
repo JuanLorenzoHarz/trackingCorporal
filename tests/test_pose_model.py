@@ -93,3 +93,13 @@ def test_bilateral_decoder_does_not_promote_weak_noise():
 
     assert report.corrected_pairs == 0
     assert abs(pose[right_ankle].x - (25 / 63)) < 1e-6
+
+
+def test_bilateral_decoder_ignores_zero_confidence_pairs():
+    heatmaps = torch.zeros((1, NUM_KEYPOINTS, 64, 64), dtype=torch.float32)
+
+    pose, report = decode_heatmaps_bilateral(heatmaps)
+
+    assert report.corrected_pairs == 0
+    for point in pose.keypoints:
+        assert point.confidence == 0.0
