@@ -2,7 +2,7 @@
 
 Modos atuais:
 - demo: webcam real + pose artificial fixa;
-- model: webcam real + CNN própria + tracking temporal + suavização.
+- model: webcam real + CNN própria + plausibilidade + tracking temporal + suavização.
 """
 
 from __future__ import annotations
@@ -21,6 +21,7 @@ from src.pose.demo_pose import build_demo_pose
 from src.pose.keypoints import NUM_KEYPOINTS
 from src.pose.model import PoseNet
 from src.preprocessing.frame_preprocessor import preprocess_frame
+from src.tracking.plausibility import PosePlausibilityEvaluator
 from src.tracking.smoothing import ExponentialPoseSmoother
 from src.tracking.temporal_tracker import TemporalPoseTracker
 from src.visualization.renderer import draw_pose
@@ -37,10 +38,13 @@ def draw_status(
     fps: float,
     mode: str,
     predicted_count: int = 0,
+    plausibility_percentage: float = 100.0,
+    rejected_count: int = 0,
+    calibrated_segments: int = 0,
 ) -> np.ndarray:
     """Exibe informações úteis da etapa atual sobre o frame."""
     if mode == "model":
-        status = "POSE MODEL + TEMPORAL TRACKING"
+        status = "POSE MODEL + PLAUSIBILITY + TRACKING"
     else:
         status = "POSE DEMO - NOT TRACKING"
 
@@ -49,7 +53,7 @@ def draw_status(
         status,
         (20, 35),
         cv2.FONT_HERSHEY_SIMPLEX,
-        0.75,
+        0.68,
         (0, 0, 255),
         2,
         cv2.LINE_AA,
@@ -67,17 +71,24 @@ def draw_status(
 
     line_y = 105
     if mode == "model":
-        cv2.putText(
-            frame,
+        lines = (
+            f"Plausibilidade: {plausibility_percentage:.0f}%",
+            f"Keypoints rejeitados: {rejected_count}",
             f"Keypoints previstos: {predicted_count}",
-            (20, line_y),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            (255, 255, 255),
-            2,
-            cv2.LINE_AA,
+            f"Calibracao anatomica: {calibrated_segments}/12",
         )
-        line_y += 35
+        for text in lines:
+            cv2.putText(
+                frame,
+                text,
+                (20, line_y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (255, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
+            line_y += 30
 
     cv2.putText(
         frame,
@@ -131,11 +142,16 @@ def main(args: argparse.Namespace | None = None) -> None:
     demo_pose = build_demo_pose() if args.mode == "demo" else None
     model: PoseNet | None = None
     input_size = 256
+    plausibility: PosePlausibilityEvaluator | None = None
     tracker: TemporalPoseTracker | None = None
     smoother: ExponentialPoseSmoother | None = None
 
     if args.mode == "model":
         model, input_size = load_pose_model(args.weights, device)
+        plausibility = PosePlausibilityEvaluator(
+            detection_threshold=args.confidence,
+            reject_threshold=args.plausibility_reject_threshold,
+        )
         tracker = TemporalPoseTracker(
             detection_threshold=args.confidence,
             max_missing_frames=args.prediction_frames,
@@ -146,15 +162,22 @@ def main(args: argparse.Namespace | None = None) -> None:
 
         print(f"Modelo de pose carregado em {device}.")
         print(
-            "Tracking temporal ativo: keypoints ocultos podem ser previstos por poucos frames."
+            "Filtro de plausibilidade ativo: proporções corporais e continuidade "
+            "temporal serão aprendidas durante os primeiros frames."
         )
+        if args.disable_plausibility_filter:
+            print(
+                "AVISO: filtro corretivo desativado; o score ainda será calculado "
+                "para comparação."
+            )
         print(
             f"Detecção mínima {args.confidence:.2f} | "
             f"render mínimo {args.render_confidence:.2f} | "
+            f"rejeição plausibilidade {args.plausibility_reject_threshold:.2f} | "
             f"previsão até {args.prediction_frames} frames | "
             f"decay {args.prediction_decay:.2f} | "
             f"peso anatômico {args.anatomy_weight:.2f} | "
-            f"Smoothing {args.smoothing_alpha:.2f}."
+            f"smoothing {args.smoothing_alpha:.2f}."
         )
 
     previous_time = time.perf_counter()
@@ -171,16 +194,23 @@ def main(args: argparse.Namespace | None = None) -> None:
             if args.mode == "demo":
                 print("A pose exibida é artificial e ainda NÃO acompanha o corpo.")
             else:
-                print("A pose vem da CNN e é refinada pelo histórico temporal.")
+                print(
+                    "A pose vem da CNN, passa pelo teste de plausibilidade e depois "
+                    "é refinada pelo histórico temporal."
+                )
 
             print("Pressione Q ou ESC na janela para encerrar.")
 
             while True:
                 frame = camera.read()
                 predicted_count = 0
+                plausibility_percentage = 100.0
+                rejected_count = 0
+                calibrated_segments = 0
 
                 if args.mode == "model":
                     assert model is not None
+                    assert plausibility is not None
                     assert tracker is not None
                     assert smoother is not None
 
@@ -193,9 +223,17 @@ def main(args: argparse.Namespace | None = None) -> None:
                         heatmaps = model(model_input)
 
                     raw_pose = decode_heatmaps(heatmaps)
-                    tracked_pose = tracker.update(raw_pose)
+                    filtered_pose, report = plausibility.evaluate_and_filter(raw_pose)
+                    pose_for_tracker = (
+                        raw_pose if args.disable_plausibility_filter else filtered_pose
+                    )
+                    tracked_pose = tracker.update(pose_for_tracker)
                     pose = smoother.update(tracked_pose)
+
                     predicted_count = tracker.predicted_count
+                    plausibility_percentage = report.percentage
+                    rejected_count = len(report.suspicious_indices)
+                    calibrated_segments = report.calibrated_segments
 
                     draw_pose(
                         frame,
@@ -216,6 +254,9 @@ def main(args: argparse.Namespace | None = None) -> None:
                     fps,
                     args.mode,
                     predicted_count=predicted_count,
+                    plausibility_percentage=plausibility_percentage,
+                    rejected_count=rejected_count,
+                    calibrated_segments=calibrated_segments,
                 )
                 cv2.imshow(WINDOW_NAME, frame)
 
@@ -274,6 +315,17 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.65,
         help="Peso da posição atual na suavização exponencial; maior = resposta mais rápida.",
+    )
+    parser.add_argument(
+        "--plausibility-reject-threshold",
+        type=float,
+        default=0.16,
+        help="Abaixo deste score local, uma observação muito improvável pode ser rejeitada.",
+    )
+    parser.add_argument(
+        "--disable-plausibility-filter",
+        action="store_true",
+        help="Calcula a métrica, mas não rejeita keypoints; útil para comparação A/B.",
     )
     return parser.parse_args()
 
