@@ -20,7 +20,7 @@ from src.pose.decoder import decode_heatmaps
 from src.pose.demo_pose import build_demo_pose
 from src.pose.keypoints import NUM_KEYPOINTS
 from src.pose.model import PoseNet
-from src.preprocessing.frame_preprocessor import preprocess_frame
+from src.preprocessing.frame_preprocessor import preprocess_frame_with_transform
 from src.tracking.plausibility import PosePlausibilityEvaluator
 from src.tracking.smoothing import ExponentialPoseSmoother
 from src.tracking.temporal_tracker import TemporalPoseTracker
@@ -164,6 +164,10 @@ def main(args: argparse.Namespace | None = None) -> None:
 
         print(f"Modelo de pose carregado em {device}.")
         print(
+            "Pré-processamento sem distorção ativo: o maior quadrado central da "
+            "webcam é usado pela CNN e os keypoints são remapeados para o frame original."
+        )
+        print(
             "Filtro de plausibilidade ativo: proporções corporais e continuidade "
             "temporal serão aprendidas durante os primeiros frames."
         )
@@ -217,7 +221,7 @@ def main(args: argparse.Namespace | None = None) -> None:
                     assert tracker is not None
                     assert smoother is not None
 
-                    model_input = preprocess_frame(
+                    model_input, transform = preprocess_frame_with_transform(
                         frame,
                         input_size=input_size,
                         device=device,
@@ -225,7 +229,8 @@ def main(args: argparse.Namespace | None = None) -> None:
                     with torch.inference_mode():
                         heatmaps = model(model_input)
 
-                    raw_pose = decode_heatmaps(heatmaps)
+                    crop_pose = decode_heatmaps(heatmaps)
+                    raw_pose = transform.pose_to_original(crop_pose)
                     filtered_pose, report = plausibility.evaluate_and_filter(raw_pose)
                     pose_for_tracker = (
                         raw_pose if args.disable_plausibility_filter else filtered_pose
