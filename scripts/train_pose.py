@@ -4,16 +4,15 @@ Exemplos:
     python -m scripts.train_pose --images data/coco/train2017 \
         --annotations data/coco/annotations/person_keypoints_train2017.json
 
-    # Treino controlado por tempo: roda por até 8 horas.
-    python -m scripts.train_pose --max-hours 8 --epochs 0 --batch-size 4
-
     # Continua a partir de um checkpoint existente.
     python -m scripts.train_pose --resume models/pose_model.pt \
         --max-hours 6 --epochs 0 --batch-size 8
 
-    # Refinamento específico para oclusões artificiais.
+    # Refinamento focado em pernas e oclusões.
     python -m scripts.train_pose --resume models/pose_model.pt \
-        --max-hours 3 --epochs 0 --occlusion-probability 0.35
+        --max-hours 6 --epochs 0 --batch-size 8 \
+        --heatmap-positive-weight 8 --leg-keypoint-weight 2.0 \
+        --occlusion-probability 0.35
 """
 
 from __future__ import annotations
@@ -27,8 +26,18 @@ from torch.nn import functional as F
 from torch.utils.data import DataLoader
 
 from src.data.coco_pose_dataset import CocoPoseDataset
-from src.pose.keypoints import NUM_KEYPOINTS
+from src.pose.keypoints import BodyKeypoint, NUM_KEYPOINTS
 from src.pose.model import PoseNet
+
+
+LEG_KEYPOINT_INDICES: tuple[int, ...] = (
+    int(BodyKeypoint.LEFT_HIP),
+    int(BodyKeypoint.RIGHT_HIP),
+    int(BodyKeypoint.LEFT_KNEE),
+    int(BodyKeypoint.RIGHT_KNEE),
+    int(BodyKeypoint.LEFT_ANKLE),
+    int(BodyKeypoint.RIGHT_ANKLE),
+)
 
 
 def masked_heatmap_loss(
@@ -36,17 +45,30 @@ def masked_heatmap_loss(
     target: torch.Tensor,
     visibility_mask: torch.Tensor,
     positive_weight: float = 0.0,
+    leg_keypoint_weight: float = 1.0,
 ) -> torch.Tensor:
-    """MSE para articulações anotadas com peso extra perto do pico do heatmap.
+    """MSE ponderado para articulações anotadas.
 
-    Heatmaps possuem milhares de pixels de fundo próximos de zero e poucos
-    pixels úteis ao redor da articulação. ``positive_weight`` impede o fundo de
-    dominar excessivamente a média e força a rede a se importar mais com a
-    localização exata do pico. Use 0 para reproduzir a loss antiga.
+    ``positive_weight`` aumenta a importância dos pixels próximos ao pico do
+    heatmap, evitando que o fundo quase todo zero domine a loss.
+
+    ``leg_keypoint_weight`` dá peso adicional aos canais de quadril, joelho e
+    tornozelo. O normalizador usa os mesmos pesos, mantendo a escala da loss
+    aproximadamente estável mesmo quando as pernas recebem maior prioridade.
     """
     squared_error = F.mse_loss(prediction, target, reduction="none")
     pixel_weights = 1.0 + target * positive_weight
-    effective_weights = pixel_weights * visibility_mask
+
+    channel_weights = torch.ones(
+        (1, prediction.shape[1], 1, 1),
+        dtype=prediction.dtype,
+        device=prediction.device,
+    )
+    for index in LEG_KEYPOINT_INDICES:
+        if index < prediction.shape[1]:
+            channel_weights[:, index] = leg_keypoint_weight
+
+    effective_weights = pixel_weights * visibility_mask * channel_weights
     weighted = squared_error * effective_weights
     normalizer = effective_weights.sum().clamp_min(1.0)
     return weighted.sum() / normalizer
@@ -69,13 +91,7 @@ def load_checkpoint_for_training(
     expected_heatmap_size: int,
     learning_rate: float,
 ) -> tuple[int, int]:
-    """Carrega pesos e, quando disponível, estado do otimizador.
-
-    Checkpoints antigos do projeto não possuíam ``optimizer_state``. Nesse caso
-    os pesos da CNN continuam normalmente, mas o Adam começa com estado novo.
-
-    Retorna ``(epoch, global_step)`` registrados no checkpoint.
-    """
+    """Carrega pesos e, quando disponível, estado do otimizador."""
     path = Path(checkpoint_path)
     if not path.is_file():
         raise FileNotFoundError(f"Checkpoint para continuar não encontrado: {path}")
@@ -139,6 +155,8 @@ def train(args: argparse.Namespace) -> None:
         raise ValueError("--max-hours deve ser maior que zero.")
     if args.heatmap_positive_weight < 0.0:
         raise ValueError("--heatmap-positive-weight não pode ser negativo.")
+    if args.leg_keypoint_weight <= 0.0:
+        raise ValueError("--leg-keypoint-weight deve ser maior que zero.")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Dispositivo de treino: {device}")
@@ -158,8 +176,9 @@ def train(args: argparse.Namespace) -> None:
     )
     print(f"Exemplos de pessoas carregados: {len(dataset)}")
     print(
-        "Peso extra nos picos dos heatmaps: "
-        f"{args.heatmap_positive_weight:.1f}."
+        "Loss: peso de pico "
+        f"{args.heatmap_positive_weight:.1f} | "
+        f"peso de quadril/joelho/tornozelo {args.leg_keypoint_weight:.2f}."
     )
 
     if args.occlusion_probability > 0.0:
@@ -226,6 +245,7 @@ def train(args: argparse.Namespace) -> None:
                     targets,
                     visibility,
                     positive_weight=args.heatmap_positive_weight,
+                    leg_keypoint_weight=args.leg_keypoint_weight,
                 )
                 loss.backward()
                 optimizer.step()
@@ -262,6 +282,7 @@ def train(args: argparse.Namespace) -> None:
                         batch_index=batch_index,
                         global_step=global_step,
                         heatmap_positive_weight=args.heatmap_positive_weight,
+                        leg_keypoint_weight=args.leg_keypoint_weight,
                     )
                     print(
                         "Limite de tempo atingido. "
@@ -279,6 +300,7 @@ def train(args: argparse.Namespace) -> None:
                 batch_index=len(loader),
                 global_step=global_step,
                 heatmap_positive_weight=args.heatmap_positive_weight,
+                leg_keypoint_weight=args.leg_keypoint_weight,
             )
 
     except KeyboardInterrupt:
@@ -292,6 +314,7 @@ def train(args: argparse.Namespace) -> None:
             batch_index=0,
             global_step=global_step,
             heatmap_positive_weight=args.heatmap_positive_weight,
+            leg_keypoint_weight=args.leg_keypoint_weight,
         )
         print(
             "Treinamento interrompido pelo usuário. "
@@ -312,6 +335,7 @@ def save_checkpoint(
     batch_index: int = 0,
     global_step: int = 0,
     heatmap_positive_weight: float = 0.0,
+    leg_keypoint_weight: float = 1.0,
 ) -> None:
     """Salva pesos e estado de treino para permitir continuação posterior."""
     path = Path(output_path)
@@ -328,6 +352,7 @@ def save_checkpoint(
             "batch_index": batch_index,
             "global_step": global_step,
             "heatmap_positive_weight": heatmap_positive_weight,
+            "leg_keypoint_weight": leg_keypoint_weight,
         },
         path,
     )
@@ -369,6 +394,12 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=8.0,
         help="Peso adicional para pixels próximos ao pico do keypoint. 0 reproduz a loss antiga.",
+    )
+    parser.add_argument(
+        "--leg-keypoint-weight",
+        type=float,
+        default=1.0,
+        help="Peso relativo dos canais de quadril, joelho e tornozelo. Use >1 para priorizar pernas.",
     )
     parser.add_argument(
         "--workers",
