@@ -1,18 +1,10 @@
-"""Treinamento da primeira CNN de pose do trackingCorporal.
+"""Treinamento da CNN de pose do trackingCorporal.
 
-Exemplos:
-    python -m scripts.train_pose --images data/coco/train2017 \
-        --annotations data/coco/annotations/person_keypoints_train2017.json
-
-    # Continua a partir de um checkpoint existente.
-    python -m scripts.train_pose --resume models/pose_model.pt \
-        --max-hours 6 --epochs 0 --batch-size 8
-
-    # Refinamento focado em pernas e oclusões.
+Exemplo de refinamento focado em pernas:
     python -m scripts.train_pose --resume models/pose_model.pt \
         --max-hours 6 --epochs 0 --batch-size 8 \
         --heatmap-positive-weight 8 --leg-keypoint-weight 2.0 \
-        --occlusion-probability 0.35
+        --bilateral-loss-weight 0.02 --occlusion-probability 0.30
 """
 
 from __future__ import annotations
@@ -39,6 +31,80 @@ LEG_KEYPOINT_INDICES: tuple[int, ...] = (
     int(BodyKeypoint.RIGHT_ANKLE),
 )
 
+BILATERAL_LEG_PAIRS: tuple[tuple[int, int], ...] = (
+    (int(BodyKeypoint.LEFT_HIP), int(BodyKeypoint.RIGHT_HIP)),
+    (int(BodyKeypoint.LEFT_KNEE), int(BodyKeypoint.RIGHT_KNEE)),
+    (int(BodyKeypoint.LEFT_ANKLE), int(BodyKeypoint.RIGHT_ANKLE)),
+)
+
+
+def bilateral_cross_peak_loss(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    visibility_mask: torch.Tensor,
+    minimum_target_distance: float = 3.0,
+) -> torch.Tensor:
+    """Penaliza confusão esquerda/direita quando os alvos estão separados.
+
+    Para cada par quadril/joelho/tornozelo, medimos quanto o canal esquerdo
+    responde na região do target direito e vice-versa. O termo só participa
+    quando ambos os pontos estão anotados e os picos verdadeiros estão separados
+    por pelo menos ``minimum_target_distance`` pixels do heatmap.
+
+    Assim pernas realmente sobrepostas/cruzadas no ground truth não recebem uma
+    penalização artificial apenas por estarem próximas na projeção 2D.
+    """
+    if minimum_target_distance < 0.0:
+        raise ValueError("minimum_target_distance não pode ser negativo.")
+
+    if prediction.ndim != 4 or target.ndim != 4:
+        raise ValueError("prediction e target devem ter formato [B,K,H,W].")
+
+    batch_size, channel_count, _, width = target.shape
+    total = prediction.new_tensor(0.0)
+    term_count = prediction.new_tensor(0.0)
+
+    for left_index, right_index in BILATERAL_LEG_PAIRS:
+        if left_index >= channel_count or right_index >= channel_count:
+            continue
+
+        left_visible = visibility_mask[:, left_index, 0, 0] > 0
+        right_visible = visibility_mask[:, right_index, 0, 0] > 0
+        both_visible = left_visible & right_visible
+        if not bool(both_visible.any()):
+            continue
+
+        left_flat = target[:, left_index].flatten(1).argmax(dim=1)
+        right_flat = target[:, right_index].flatten(1).argmax(dim=1)
+
+        left_y = torch.div(left_flat, width, rounding_mode="floor").float()
+        left_x = (left_flat % width).float()
+        right_y = torch.div(right_flat, width, rounding_mode="floor").float()
+        right_x = (right_flat % width).float()
+        separation = torch.sqrt(
+            (left_x - right_x).square() + (left_y - right_y).square()
+        )
+
+        eligible = both_visible & (separation >= minimum_target_distance)
+        if not bool(eligible.any()):
+            continue
+
+        left_wrong_region = (
+            prediction[:, left_index].square() * target[:, right_index]
+        ).sum(dim=(1, 2)) / target[:, right_index].sum(dim=(1, 2)).clamp_min(1e-6)
+        right_wrong_region = (
+            prediction[:, right_index].square() * target[:, left_index]
+        ).sum(dim=(1, 2)) / target[:, left_index].sum(dim=(1, 2)).clamp_min(1e-6)
+
+        total = total + left_wrong_region[eligible].sum()
+        total = total + right_wrong_region[eligible].sum()
+        term_count = term_count + eligible.sum().to(prediction.dtype) * 2.0
+
+    if float(term_count.item()) == 0.0:
+        return prediction.sum() * 0.0
+
+    return total / term_count
+
 
 def masked_heatmap_loss(
     prediction: torch.Tensor,
@@ -46,16 +112,10 @@ def masked_heatmap_loss(
     visibility_mask: torch.Tensor,
     positive_weight: float = 0.0,
     leg_keypoint_weight: float = 1.0,
+    bilateral_loss_weight: float = 0.0,
+    bilateral_min_target_distance: float = 3.0,
 ) -> torch.Tensor:
-    """MSE ponderado para articulações anotadas.
-
-    ``positive_weight`` aumenta a importância dos pixels próximos ao pico do
-    heatmap, evitando que o fundo quase todo zero domine a loss.
-
-    ``leg_keypoint_weight`` dá peso adicional aos canais de quadril, joelho e
-    tornozelo. O normalizador usa os mesmos pesos, mantendo a escala da loss
-    aproximadamente estável mesmo quando as pernas recebem maior prioridade.
-    """
+    """MSE ponderado com opção de prioridade e separação bilateral."""
     squared_error = F.mse_loss(prediction, target, reduction="none")
     pixel_weights = 1.0 + target * positive_weight
 
@@ -71,11 +131,21 @@ def masked_heatmap_loss(
     effective_weights = pixel_weights * visibility_mask * channel_weights
     weighted = squared_error * effective_weights
     normalizer = effective_weights.sum().clamp_min(1.0)
-    return weighted.sum() / normalizer
+    base_loss = weighted.sum() / normalizer
+
+    if bilateral_loss_weight <= 0.0:
+        return base_loss
+
+    bilateral = bilateral_cross_peak_loss(
+        prediction,
+        target,
+        visibility_mask,
+        minimum_target_distance=bilateral_min_target_distance,
+    )
+    return base_loss + bilateral_loss_weight * bilateral
 
 
 def format_duration(seconds: float) -> str:
-    """Formata segundos como HH:MM:SS para os logs de treinamento."""
     total_seconds = max(0, int(seconds))
     hours, remainder = divmod(total_seconds, 3600)
     minutes, seconds = divmod(remainder, 60)
@@ -91,7 +161,6 @@ def load_checkpoint_for_training(
     expected_heatmap_size: int,
     learning_rate: float,
 ) -> tuple[int, int]:
-    """Carrega pesos e, quando disponível, estado do otimizador."""
     path = Path(checkpoint_path)
     if not path.is_file():
         raise FileNotFoundError(f"Checkpoint para continuar não encontrado: {path}")
@@ -144,7 +213,6 @@ def load_checkpoint_for_training(
         f"Checkpoint anterior: epoch {saved_epoch}, "
         f"batch {saved_batch}, global_step {saved_global_step}."
     )
-
     return saved_epoch, saved_global_step
 
 
@@ -157,6 +225,10 @@ def train(args: argparse.Namespace) -> None:
         raise ValueError("--heatmap-positive-weight não pode ser negativo.")
     if args.leg_keypoint_weight <= 0.0:
         raise ValueError("--leg-keypoint-weight deve ser maior que zero.")
+    if args.bilateral_loss_weight < 0.0:
+        raise ValueError("--bilateral-loss-weight não pode ser negativo.")
+    if args.bilateral_min_target_distance < 0.0:
+        raise ValueError("--bilateral-min-target-distance não pode ser negativo.")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Dispositivo de treino: {device}")
@@ -178,14 +250,15 @@ def train(args: argparse.Namespace) -> None:
     print(
         "Loss: peso de pico "
         f"{args.heatmap_positive_weight:.1f} | "
-        f"peso de quadril/joelho/tornozelo {args.leg_keypoint_weight:.2f}."
+        f"peso das pernas {args.leg_keypoint_weight:.2f} | "
+        f"bilateral {args.bilateral_loss_weight:.3f}."
     )
 
     if args.occlusion_probability > 0.0:
         print(
             "Oclusão artificial ativa: "
             f"probabilidade {args.occlusion_probability:.2f}, "
-            f"tamanho {args.occlusion_min_size:.2f}-{args.occlusion_max_size:.2f} do recorte."
+            f"tamanho {args.occlusion_min_size:.2f}-{args.occlusion_max_size:.2f}."
         )
 
     loader = DataLoader(
@@ -246,6 +319,8 @@ def train(args: argparse.Namespace) -> None:
                     visibility,
                     positive_weight=args.heatmap_positive_weight,
                     leg_keypoint_weight=args.leg_keypoint_weight,
+                    bilateral_loss_weight=args.bilateral_loss_weight,
+                    bilateral_min_target_distance=args.bilateral_min_target_distance,
                 )
                 loss.backward()
                 optimizer.step()
@@ -264,11 +339,9 @@ def train(args: argparse.Namespace) -> None:
                         f"loss {average:.6f} | "
                         f"tempo {format_duration(elapsed)}"
                     )
-
                     if max_seconds is not None:
                         remaining = max(0.0, max_seconds - elapsed)
                         message += f" | restante {format_duration(remaining)}"
-
                     print(message)
 
                 if max_seconds is not None and elapsed >= max_seconds:
@@ -283,6 +356,7 @@ def train(args: argparse.Namespace) -> None:
                         global_step=global_step,
                         heatmap_positive_weight=args.heatmap_positive_weight,
                         leg_keypoint_weight=args.leg_keypoint_weight,
+                        bilateral_loss_weight=args.bilateral_loss_weight,
                     )
                     print(
                         "Limite de tempo atingido. "
@@ -301,6 +375,7 @@ def train(args: argparse.Namespace) -> None:
                 global_step=global_step,
                 heatmap_positive_weight=args.heatmap_positive_weight,
                 leg_keypoint_weight=args.leg_keypoint_weight,
+                bilateral_loss_weight=args.bilateral_loss_weight,
             )
 
     except KeyboardInterrupt:
@@ -315,6 +390,7 @@ def train(args: argparse.Namespace) -> None:
             global_step=global_step,
             heatmap_positive_weight=args.heatmap_positive_weight,
             leg_keypoint_weight=args.leg_keypoint_weight,
+            bilateral_loss_weight=args.bilateral_loss_weight,
         )
         print(
             "Treinamento interrompido pelo usuário. "
@@ -336,8 +412,8 @@ def save_checkpoint(
     global_step: int = 0,
     heatmap_positive_weight: float = 0.0,
     leg_keypoint_weight: float = 1.0,
+    bilateral_loss_weight: float = 0.0,
 ) -> None:
-    """Salva pesos e estado de treino para permitir continuação posterior."""
     path = Path(output_path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -353,24 +429,21 @@ def save_checkpoint(
             "global_step": global_step,
             "heatmap_positive_weight": heatmap_positive_weight,
             "leg_keypoint_weight": leg_keypoint_weight,
+            "bilateral_loss_weight": bilateral_loss_weight,
         },
         path,
     )
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Treina a primeira CNN de pose.")
+    parser = argparse.ArgumentParser(description="Treina a CNN de pose.")
     parser.add_argument("--images", default="data/coco/train2017")
     parser.add_argument(
         "--annotations",
         default="data/coco/annotations/person_keypoints_train2017.json",
     )
     parser.add_argument("--output", default="models/pose_model.pt")
-    parser.add_argument(
-        "--resume",
-        default=None,
-        help="Checkpoint existente cujos pesos devem ser usados para continuar o treino.",
-    )
+    parser.add_argument("--resume", default=None)
     parser.add_argument("--input-size", type=int, default=256)
     parser.add_argument("--heatmap-size", type=int, default=64)
     parser.add_argument("--sigma", type=float, default=1.8)
@@ -380,63 +453,30 @@ def parse_args() -> argparse.Namespace:
         "--epochs",
         type=int,
         default=10,
-        help="Quantidade máxima de épocas desta sessão. Use 0 para deixar --max-hours controlar.",
+        help="Quantidade máxima de épocas desta sessão. Use 0 com --max-hours.",
     )
-    parser.add_argument(
-        "--max-hours",
-        type=float,
-        default=None,
-        help="Encerra esta sessão após aproximadamente esta quantidade de horas e salva o checkpoint.",
-    )
+    parser.add_argument("--max-hours", type=float, default=None)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
+    parser.add_argument("--heatmap-positive-weight", type=float, default=8.0)
+    parser.add_argument("--leg-keypoint-weight", type=float, default=1.0)
     parser.add_argument(
-        "--heatmap-positive-weight",
-        type=float,
-        default=8.0,
-        help="Peso adicional para pixels próximos ao pico do keypoint. 0 reproduz a loss antiga.",
-    )
-    parser.add_argument(
-        "--leg-keypoint-weight",
-        type=float,
-        default=1.0,
-        help="Peso relativo dos canais de quadril, joelho e tornozelo. Use >1 para priorizar pernas.",
-    )
-    parser.add_argument(
-        "--workers",
-        type=int,
-        default=0,
-        help="0 é o valor mais simples/seguro no Windows para começar.",
-    )
-    parser.add_argument(
-        "--max-samples",
-        type=int,
-        default=None,
-        help="Limita exemplos para testes rápidos. Omitido = usa todos os exemplos disponíveis.",
-    )
-    parser.add_argument(
-        "--occlusion-probability",
+        "--bilateral-loss-weight",
         type=float,
         default=0.0,
-        help="Chance de esconder artificialmente uma região de cada pessoa durante o treino.",
+        help="Peso da penalização de confusão esquerda/direita. 0 mantém compatibilidade.",
     )
     parser.add_argument(
-        "--occlusion-min-size",
+        "--bilateral-min-target-distance",
         type=float,
-        default=0.12,
-        help="Menor lado relativo do retângulo de oclusão.",
+        default=3.0,
+        help="Separação mínima dos alvos em pixels do heatmap para aplicar loss bilateral.",
     )
-    parser.add_argument(
-        "--occlusion-max-size",
-        type=float,
-        default=0.35,
-        help="Maior lado relativo do retângulo de oclusão.",
-    )
-    parser.add_argument(
-        "--augmentation-seed",
-        type=int,
-        default=None,
-        help="Seed opcional para reproduzir as oclusões artificiais.",
-    )
+    parser.add_argument("--workers", type=int, default=0)
+    parser.add_argument("--max-samples", type=int, default=None)
+    parser.add_argument("--occlusion-probability", type=float, default=0.0)
+    parser.add_argument("--occlusion-min-size", type=float, default=0.12)
+    parser.add_argument("--occlusion-max-size", type=float, default=0.35)
+    parser.add_argument("--augmentation-seed", type=int, default=None)
     parser.add_argument("--log-every", type=int, default=20)
     return parser.parse_args()
 
