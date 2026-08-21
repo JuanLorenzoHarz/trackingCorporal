@@ -35,14 +35,21 @@ def masked_heatmap_loss(
     prediction: torch.Tensor,
     target: torch.Tensor,
     visibility_mask: torch.Tensor,
+    positive_weight: float = 0.0,
 ) -> torch.Tensor:
-    """MSE apenas para articulações anotadas no exemplo."""
-    squared_error = F.mse_loss(prediction, target, reduction="none")
-    weighted = squared_error * visibility_mask
+    """MSE para articulações anotadas com peso extra perto do pico do heatmap.
 
-    visible_points = visibility_mask.sum().clamp_min(1.0)
-    pixels_per_heatmap = target.shape[-1] * target.shape[-2]
-    return weighted.sum() / (visible_points * pixels_per_heatmap)
+    Heatmaps possuem milhares de pixels de fundo próximos de zero e poucos
+    pixels úteis ao redor da articulação. ``positive_weight`` impede o fundo de
+    dominar excessivamente a média e força a rede a se importar mais com a
+    localização exata do pico. Use 0 para reproduzir a loss antiga.
+    """
+    squared_error = F.mse_loss(prediction, target, reduction="none")
+    pixel_weights = 1.0 + target * positive_weight
+    effective_weights = pixel_weights * visibility_mask
+    weighted = squared_error * effective_weights
+    normalizer = effective_weights.sum().clamp_min(1.0)
+    return weighted.sum() / normalizer
 
 
 def format_duration(seconds: float) -> str:
@@ -130,6 +137,8 @@ def train(args: argparse.Namespace) -> None:
         raise ValueError("Use --epochs maior que 0 ou informe --max-hours.")
     if args.max_hours is not None and args.max_hours <= 0:
         raise ValueError("--max-hours deve ser maior que zero.")
+    if args.heatmap_positive_weight < 0.0:
+        raise ValueError("--heatmap-positive-weight não pode ser negativo.")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Dispositivo de treino: {device}")
@@ -148,6 +157,10 @@ def train(args: argparse.Namespace) -> None:
         augmentation_seed=args.augmentation_seed,
     )
     print(f"Exemplos de pessoas carregados: {len(dataset)}")
+    print(
+        "Peso extra nos picos dos heatmaps: "
+        f"{args.heatmap_positive_weight:.1f}."
+    )
 
     if args.occlusion_probability > 0.0:
         print(
@@ -208,7 +221,12 @@ def train(args: argparse.Namespace) -> None:
 
                 optimizer.zero_grad(set_to_none=True)
                 prediction = model(images)
-                loss = masked_heatmap_loss(prediction, targets, visibility)
+                loss = masked_heatmap_loss(
+                    prediction,
+                    targets,
+                    visibility,
+                    positive_weight=args.heatmap_positive_weight,
+                )
                 loss.backward()
                 optimizer.step()
 
@@ -243,6 +261,7 @@ def train(args: argparse.Namespace) -> None:
                         epoch=current_epoch,
                         batch_index=batch_index,
                         global_step=global_step,
+                        heatmap_positive_weight=args.heatmap_positive_weight,
                     )
                     print(
                         "Limite de tempo atingido. "
@@ -259,6 +278,7 @@ def train(args: argparse.Namespace) -> None:
                 epoch=current_epoch,
                 batch_index=len(loader),
                 global_step=global_step,
+                heatmap_positive_weight=args.heatmap_positive_weight,
             )
 
     except KeyboardInterrupt:
@@ -271,6 +291,7 @@ def train(args: argparse.Namespace) -> None:
             epoch=current_epoch,
             batch_index=0,
             global_step=global_step,
+            heatmap_positive_weight=args.heatmap_positive_weight,
         )
         print(
             "Treinamento interrompido pelo usuário. "
@@ -290,6 +311,7 @@ def save_checkpoint(
     epoch: int,
     batch_index: int = 0,
     global_step: int = 0,
+    heatmap_positive_weight: float = 0.0,
 ) -> None:
     """Salva pesos e estado de treino para permitir continuação posterior."""
     path = Path(output_path)
@@ -305,6 +327,7 @@ def save_checkpoint(
             "epoch": epoch,
             "batch_index": batch_index,
             "global_step": global_step,
+            "heatmap_positive_weight": heatmap_positive_weight,
         },
         path,
     )
@@ -341,6 +364,12 @@ def parse_args() -> argparse.Namespace:
         help="Encerra esta sessão após aproximadamente esta quantidade de horas e salva o checkpoint.",
     )
     parser.add_argument("--learning-rate", type=float, default=1e-3)
+    parser.add_argument(
+        "--heatmap-positive-weight",
+        type=float,
+        default=8.0,
+        help="Peso adicional para pixels próximos ao pico do keypoint. 0 reproduz a loss antiga.",
+    )
     parser.add_argument(
         "--workers",
         type=int,
