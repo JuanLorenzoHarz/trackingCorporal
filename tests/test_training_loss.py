@@ -2,7 +2,7 @@
 
 import torch
 
-from scripts.train_pose import masked_heatmap_loss
+from scripts.train_pose import bilateral_cross_peak_loss, masked_heatmap_loss
 from src.pose.keypoints import BodyKeypoint, NUM_KEYPOINTS
 
 
@@ -76,3 +76,58 @@ def test_leg_weight_penalizes_missing_knee_more_than_missing_nose():
     )
 
     assert knee_loss > nose_loss
+
+
+def test_bilateral_loss_penalizes_both_knees_on_same_target():
+    target = torch.zeros((1, NUM_KEYPOINTS, 16, 16), dtype=torch.float32)
+    visibility = torch.zeros((1, NUM_KEYPOINTS, 1, 1), dtype=torch.float32)
+    left_knee = int(BodyKeypoint.LEFT_KNEE)
+    right_knee = int(BodyKeypoint.RIGHT_KNEE)
+
+    target[0, left_knee, 10, 4] = 1.0
+    target[0, right_knee, 10, 12] = 1.0
+    visibility[0, left_knee] = 1.0
+    visibility[0, right_knee] = 1.0
+
+    correct = target.clone()
+    collapsed = target.clone()
+    collapsed[0, right_knee].zero_()
+    collapsed[0, right_knee, 10, 4] = 1.0
+
+    correct_loss = bilateral_cross_peak_loss(
+        correct,
+        target,
+        visibility,
+        minimum_target_distance=3.0,
+    )
+    collapsed_loss = bilateral_cross_peak_loss(
+        collapsed,
+        target,
+        visibility,
+        minimum_target_distance=3.0,
+    )
+
+    assert float(correct_loss.item()) == 0.0
+    assert collapsed_loss > correct_loss
+
+
+def test_bilateral_loss_ignores_overlapping_ground_truth():
+    target = torch.zeros((1, NUM_KEYPOINTS, 16, 16), dtype=torch.float32)
+    visibility = torch.zeros((1, NUM_KEYPOINTS, 1, 1), dtype=torch.float32)
+    left_ankle = int(BodyKeypoint.LEFT_ANKLE)
+    right_ankle = int(BodyKeypoint.RIGHT_ANKLE)
+
+    target[0, left_ankle, 12, 8] = 1.0
+    target[0, right_ankle, 12, 8] = 1.0
+    visibility[0, left_ankle] = 1.0
+    visibility[0, right_ankle] = 1.0
+
+    prediction = target.clone()
+    loss = bilateral_cross_peak_loss(
+        prediction,
+        target,
+        visibility,
+        minimum_target_distance=3.0,
+    )
+
+    assert float(loss.item()) == 0.0
