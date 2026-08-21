@@ -62,12 +62,14 @@ def decode_heatmaps_bilateral(
     tornozelo esquerdo/direito ficam praticamente no mesmo ponto, procuramos
     outras máximas locais. Uma alternativa só é aceita quando:
 
+    - os dois canais possuem evidência positiva para o par;
     - fica suficientemente distante do outro lado;
     - mantém confiança razoavelmente próxima ao melhor pico do próprio canal;
     - a soma das duas confianças não cai demais em relação à solução original.
 
     Dessa forma uma segunda hipótese real pode ser recuperada, mas um pico fraco
-    de ruído não é promovido apenas para forçar duas pernas separadas.
+    de ruído ou um heatmap zerado não é promovido apenas para forçar duas pernas
+    separadas.
     """
     if top_k < 1:
         raise ValueError("top_k deve ser pelo menos 1.")
@@ -97,8 +99,14 @@ def decode_heatmaps_bilateral(
     for left_index, right_index in LOWER_BODY_PAIRS:
         left_top = selected[left_index]
         right_top = selected[right_index]
-        top_distance = hypot(left_top.x - right_top.x, left_top.y - right_top.y)
 
+        # Heatmaps sem evidência positiva não possuem uma segunda hipótese útil.
+        # Sem este corte, um mapa totalmente zerado poderia gerar "picos"
+        # arbitrários de confiança 0 após a supressão e ser contado como correção.
+        if left_top.confidence <= 0.0 or right_top.confidence <= 0.0:
+            continue
+
+        top_distance = hypot(left_top.x - right_top.x, left_top.y - right_top.y)
         if top_distance >= minimum_separation_pixels:
             continue
 
@@ -111,10 +119,14 @@ def decode_heatmaps_bilateral(
         right_min_confidence = right_top.confidence * minimum_alternative_ratio
 
         for left_candidate in candidates_by_keypoint[left_index]:
+            if left_candidate.confidence <= 0.0:
+                continue
             if left_candidate.confidence < left_min_confidence:
                 continue
 
             for right_candidate in candidates_by_keypoint[right_index]:
+                if right_candidate.confidence <= 0.0:
+                    continue
                 if right_candidate.confidence < right_min_confidence:
                     continue
 
@@ -165,20 +177,29 @@ def _top_candidates(
     top_k: int,
     suppression_radius: int,
 ) -> list[_PeakCandidate]:
-    """Retorna máximas locais separadas por NMS quadrado simples."""
+    """Retorna máximas locais separadas por NMS quadrado simples.
+
+    O primeiro máximo é sempre retornado para manter compatibilidade com o
+    decoder simples. Depois dele, candidatos com confiança <= 0 não são úteis
+    como hipóteses alternativas e encerram a busca.
+    """
     height, width = heatmap.shape
     working = heatmap.clone()
     candidates: list[_PeakCandidate] = []
 
-    for _ in range(top_k):
+    for candidate_index in range(top_k):
         flat_index = int(torch.argmax(working).item())
         y = flat_index // width
         x = flat_index % width
         raw_confidence = float(heatmap[y, x].item())
         confidence = min(1.0, max(0.0, raw_confidence))
+
+        if candidate_index > 0 and confidence <= 0.0:
+            break
+
         candidates.append(_PeakCandidate(x=x, y=y, confidence=confidence))
 
-        if suppression_radius == 0:
+        if suppression_radius == 0 or confidence <= 0.0:
             break
 
         left = max(0, x - suppression_radius)
