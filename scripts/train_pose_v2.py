@@ -134,6 +134,8 @@ def masked_offset_loss(
 
     Pesos por keypoint também podem reforçar a associação de punho->cotovelo e
     tornozelo->joelho, que é especialmente importante para evitar conexões em X.
+    A normalização usa a máscara original, de modo que o peso extra realmente
+    aumente a contribuição/gradiente das extremidades em vez de se cancelar.
     """
     if prediction.ndim != 4 or target.shape != prediction.shape:
         raise ValueError("prediction/target de offset devem ter o mesmo formato [B,2K,H,W].")
@@ -159,7 +161,7 @@ def masked_offset_loss(
 
     expanded_mask = weighted_mask.unsqueeze(2)
     error = F.smooth_l1_loss(pred, tgt, reduction="none") * expanded_mask
-    denominator = expanded_mask.sum().clamp_min(1.0) * 2.0
+    denominator = mask.sum().clamp_min(1.0) * 2.0
     return error.sum() / denominator
 
 
