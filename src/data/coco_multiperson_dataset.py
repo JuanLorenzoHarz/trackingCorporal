@@ -21,8 +21,8 @@ from src.pose.structure_v2 import BILATERAL_PAIRS, PARENT_BY_KEYPOINT
 
 
 FLIP_PAIRS: tuple[tuple[int, int], ...] = (
-    (1, 2),  # eyes
-    (3, 4),  # ears
+    (1, 2),
+    (3, 4),
     *BILATERAL_PAIRS,
 )
 
@@ -201,8 +201,6 @@ class CocoMultiPersonPoseDataset(Dataset):
 
     def _flip_targets(self, targets: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         result = {name: torch.flip(tensor.clone(), dims=(-1,)) for name, tensor in targets.items()}
-        result["center"] = torch.flip(targets["center"].clone(), dims=(-1,))
-
         for name in ("keypoints", "center_offset_mask", "parent_offset_mask"):
             tensor = result[name]
             for left, right in FLIP_PAIRS:
@@ -218,7 +216,6 @@ class CocoMultiPersonPoseDataset(Dataset):
                 tensor[right] = left_copy
             tensor[:, 0].mul_(-1.0)
             result[name] = tensor.view(NUM_KEYPOINTS * 2, self.heatmap_size, self.heatmap_size)
-
         return result
 
     def _input_to_heatmap(self, x: float, y: float) -> tuple[float, float]:
@@ -246,3 +243,10 @@ class CocoMultiPersonPoseDataset(Dataset):
             / (2.0 * sigma * sigma)
         )
         heatmap[top:bottom, left:right] = torch.maximum(heatmap[top:bottom, left:right], gaussian)
+
+        # Focal loss precisa de um positivo inequívoco. Mantemos a posição
+        # fracionária para offsets, mas garantimos pico 1.0 no pixel mais próximo.
+        peak_x = int(round(center_x))
+        peak_y = int(round(center_y))
+        if 0 <= peak_x < width and 0 <= peak_y < height:
+            heatmap[peak_y, peak_x] = 1.0
