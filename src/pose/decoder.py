@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from math import hypot
+from math import hypot, sqrt
+from statistics import mean
 
 import torch
 
@@ -16,6 +17,19 @@ class BilateralDecodeReport:
     """Diagnóstico de correções esquerda/direita feitas no decoder."""
 
     corrected_pairs: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class PeakQualityDecodeReport:
+    """Diagnóstico da nitidez/unicidade dos picos escolhidos."""
+
+    mean_quality: float
+    mean_raw_confidence: float
+    ambiguous_keypoints: int
+
+    @property
+    def percentage(self) -> float:
+        return self.mean_quality * 100.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -32,11 +46,7 @@ LOWER_BODY_PAIRS: tuple[tuple[int, int], ...] = (
 
 
 def decode_heatmaps(heatmaps: torch.Tensor) -> Pose:
-    """Converte heatmaps [17,H,W] ou [1,17,H,W] em uma Pose.
-
-    Esta função mantém o comportamento simples original: cada keypoint usa o
-    maior valor do respectivo heatmap.
-    """
+    """Decoder simples original: usa apenas o maior valor de cada heatmap."""
     heatmaps = _prepare_heatmaps(heatmaps)
     _, height, width = heatmaps.shape
     points: list[Keypoint] = []
@@ -48,6 +58,87 @@ def decode_heatmaps(heatmaps: torch.Tensor) -> Pose:
     return Pose(points)
 
 
+def decode_heatmaps_reliable(
+    heatmaps: torch.Tensor,
+    suppression_radius: int = 4,
+    full_confidence_dominance: float = 0.35,
+    ambiguous_quality_threshold: float = 0.50,
+) -> tuple[Pose, PeakQualityDecodeReport]:
+    """Decodifica o melhor pico, mas reduz confiança quando há ambiguidade.
+
+    A rede foi treinada com MSE em heatmaps e o valor máximo bruto não é uma
+    probabilidade calibrada. Um objeto de fundo pode produzir um máximo positivo
+    mesmo sem existir uma articulação real. Para evitar confiar cegamente nesse
+    número, comparamos o maior pico com a melhor hipótese espacialmente distinta.
+
+    Se o maior e o segundo pico são muito parecidos, a confiança final cai. A
+    posição escolhida continua sendo o argmax; este decoder nunca promove o 2º
+    ou 3º pico, portanto segue a política conservadora de "na dúvida, não inventar".
+    """
+    if suppression_radius < 0:
+        raise ValueError("suppression_radius não pode ser negativo.")
+    if full_confidence_dominance <= 0.0:
+        raise ValueError("full_confidence_dominance deve ser positivo.")
+    if not 0.0 <= ambiguous_quality_threshold <= 1.0:
+        raise ValueError("ambiguous_quality_threshold deve estar entre 0 e 1.")
+
+    heatmaps = _prepare_heatmaps(heatmaps)
+    _, height, width = heatmaps.shape
+    points: list[Keypoint] = []
+    qualities: list[float] = []
+    raw_confidences: list[float] = []
+    ambiguous = 0
+
+    for heatmap in heatmaps:
+        candidates = _top_candidates(
+            heatmap,
+            top_k=2,
+            suppression_radius=suppression_radius,
+        )
+        primary = candidates[0]
+        secondary_confidence = candidates[1].confidence if len(candidates) > 1 else 0.0
+        raw_confidences.append(primary.confidence)
+
+        if primary.confidence <= 0.0:
+            quality = 0.0
+            calibrated_confidence = 0.0
+        elif secondary_confidence <= 0.0:
+            quality = 1.0
+            calibrated_confidence = primary.confidence
+        else:
+            dominance = max(
+                0.0,
+                (primary.confidence - secondary_confidence)
+                / max(primary.confidence, 1e-6),
+            )
+            quality = min(1.0, dominance / full_confidence_dominance)
+            # sqrt deixa a redução progressiva: ambiguidade baixa não mata um
+            # keypoint bom, mas dois picos quase iguais perdem bastante confiança.
+            calibrated_confidence = primary.confidence * sqrt(quality)
+
+        if quality < ambiguous_quality_threshold:
+            ambiguous += 1
+        qualities.append(quality)
+        points.append(
+            _candidate_to_keypoint(
+                _PeakCandidate(
+                    x=primary.x,
+                    y=primary.y,
+                    confidence=calibrated_confidence,
+                ),
+                width,
+                height,
+            )
+        )
+
+    report = PeakQualityDecodeReport(
+        mean_quality=mean(qualities) if qualities else 0.0,
+        mean_raw_confidence=mean(raw_confidences) if raw_confidences else 0.0,
+        ambiguous_keypoints=ambiguous,
+    )
+    return Pose(points), report
+
+
 def decode_heatmaps_bilateral(
     heatmaps: torch.Tensor,
     top_k: int = 3,
@@ -56,20 +147,11 @@ def decode_heatmaps_bilateral(
     minimum_alternative_ratio: float = 0.65,
     minimum_pair_score_ratio: float = 0.82,
 ) -> tuple[Pose, BilateralDecodeReport]:
-    """Decodifica heatmaps tentando evitar colapso das duas pernas no mesmo pico.
+    """Decoder experimental que pode promover picos alternativos das pernas.
 
-    Cada canal continua usando seu maior pico normalmente. Quando joelho ou
-    tornozelo esquerdo/direito ficam praticamente no mesmo ponto, procuramos
-    outras máximas locais. Uma alternativa só é aceita quando:
-
-    - os dois canais possuem evidência positiva para o par;
-    - fica suficientemente distante do outro lado;
-    - mantém confiança razoavelmente próxima ao melhor pico do próprio canal;
-    - a soma das duas confianças não cai demais em relação à solução original.
-
-    Dessa forma uma segunda hipótese real pode ser recuperada, mas um pico fraco
-    de ruído ou um heatmap zerado não é promovido apenas para forçar duas pernas
-    separadas.
+    Ele permanece disponível para comparação, mas não deve ser a opção padrão:
+    promover hipóteses secundárias pode aumentar alucinações quando os heatmaps
+    ainda não estão suficientemente bem separados.
     """
     if top_k < 1:
         raise ValueError("top_k deve ser pelo menos 1.")
@@ -99,10 +181,6 @@ def decode_heatmaps_bilateral(
     for left_index, right_index in LOWER_BODY_PAIRS:
         left_top = selected[left_index]
         right_top = selected[right_index]
-
-        # Heatmaps sem evidência positiva não possuem uma segunda hipótese útil.
-        # Sem este corte, um mapa totalmente zerado poderia gerar "picos"
-        # arbitrários de confiança 0 após a supressão e ser contado como correção.
         if left_top.confidence <= 0.0 or right_top.confidence <= 0.0:
             continue
 
@@ -177,12 +255,7 @@ def _top_candidates(
     top_k: int,
     suppression_radius: int,
 ) -> list[_PeakCandidate]:
-    """Retorna máximas locais separadas por NMS quadrado simples.
-
-    O primeiro máximo é sempre retornado para manter compatibilidade com o
-    decoder simples. Depois dele, candidatos com confiança <= 0 não são úteis
-    como hipóteses alternativas e encerram a busca.
-    """
+    """Retorna máximas locais separadas por NMS quadrado simples."""
     height, width = heatmap.shape
     working = heatmap.clone()
     candidates: list[_PeakCandidate] = []
