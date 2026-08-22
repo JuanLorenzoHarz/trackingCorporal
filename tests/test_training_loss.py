@@ -12,19 +12,8 @@ def test_positive_heatmap_weight_emphasizes_keypoint_peak():
     target[0, 0, 4, 4] = 1.0
     visibility = torch.ones((1, 1, 1, 1), dtype=torch.float32)
 
-    old_style = masked_heatmap_loss(
-        prediction,
-        target,
-        visibility,
-        positive_weight=0.0,
-    )
-    weighted = masked_heatmap_loss(
-        prediction,
-        target,
-        visibility,
-        positive_weight=8.0,
-    )
-
+    old_style = masked_heatmap_loss(prediction, target, visibility, positive_weight=0.0)
+    weighted = masked_heatmap_loss(prediction, target, visibility, positive_weight=8.0)
     assert weighted > old_style
 
 
@@ -32,21 +21,29 @@ def test_invisible_keypoint_does_not_affect_loss():
     prediction = torch.ones((1, 1, 8, 8), dtype=torch.float32)
     target = torch.zeros_like(prediction)
     visibility = torch.zeros((1, 1, 1, 1), dtype=torch.float32)
+    loss = masked_heatmap_loss(prediction, target, visibility, positive_weight=8.0)
+    assert float(loss.item()) == 0.0
+
+
+def test_negative_sample_supervises_all_heatmaps_to_zero():
+    prediction = torch.full((1, NUM_KEYPOINTS, 8, 8), 0.25, dtype=torch.float32)
+    target = torch.zeros_like(prediction)
+    supervision = torch.ones((1, NUM_KEYPOINTS, 1, 1), dtype=torch.float32)
 
     loss = masked_heatmap_loss(
         prediction,
         target,
-        visibility,
+        supervision,
         positive_weight=8.0,
+        leg_keypoint_weight=2.0,
+        bilateral_loss_weight=0.02,
     )
-
-    assert float(loss.item()) == 0.0
+    assert loss > 0.0
 
 
 def test_leg_weight_penalizes_missing_knee_more_than_missing_nose():
     target = torch.zeros((1, NUM_KEYPOINTS, 8, 8), dtype=torch.float32)
     visibility = torch.zeros((1, NUM_KEYPOINTS, 1, 1), dtype=torch.float32)
-
     nose = int(BodyKeypoint.NOSE)
     knee = int(BodyKeypoint.LEFT_KNEE)
     target[0, nose, 4, 4] = 1.0
@@ -56,7 +53,6 @@ def test_leg_weight_penalizes_missing_knee_more_than_missing_nose():
 
     misses_nose = target.clone()
     misses_nose[0, nose, 4, 4] = 0.0
-
     misses_knee = target.clone()
     misses_knee[0, knee, 4, 4] = 0.0
 
@@ -74,7 +70,6 @@ def test_leg_weight_penalizes_missing_knee_more_than_missing_nose():
         positive_weight=8.0,
         leg_keypoint_weight=2.0,
     )
-
     assert knee_loss > nose_loss
 
 
@@ -83,7 +78,6 @@ def test_bilateral_loss_penalizes_both_knees_on_same_target():
     visibility = torch.zeros((1, NUM_KEYPOINTS, 1, 1), dtype=torch.float32)
     left_knee = int(BodyKeypoint.LEFT_KNEE)
     right_knee = int(BodyKeypoint.RIGHT_KNEE)
-
     target[0, left_knee, 10, 4] = 1.0
     target[0, right_knee, 10, 12] = 1.0
     visibility[0, left_knee] = 1.0
@@ -94,19 +88,8 @@ def test_bilateral_loss_penalizes_both_knees_on_same_target():
     collapsed[0, right_knee].zero_()
     collapsed[0, right_knee, 10, 4] = 1.0
 
-    correct_loss = bilateral_cross_peak_loss(
-        correct,
-        target,
-        visibility,
-        minimum_target_distance=3.0,
-    )
-    collapsed_loss = bilateral_cross_peak_loss(
-        collapsed,
-        target,
-        visibility,
-        minimum_target_distance=3.0,
-    )
-
+    correct_loss = bilateral_cross_peak_loss(correct, target, visibility, minimum_target_distance=3.0)
+    collapsed_loss = bilateral_cross_peak_loss(collapsed, target, visibility, minimum_target_distance=3.0)
     assert float(correct_loss.item()) == 0.0
     assert collapsed_loss > correct_loss
 
@@ -116,18 +99,25 @@ def test_bilateral_loss_ignores_overlapping_ground_truth():
     visibility = torch.zeros((1, NUM_KEYPOINTS, 1, 1), dtype=torch.float32)
     left_ankle = int(BodyKeypoint.LEFT_ANKLE)
     right_ankle = int(BodyKeypoint.RIGHT_ANKLE)
-
     target[0, left_ankle, 12, 8] = 1.0
     target[0, right_ankle, 12, 8] = 1.0
     visibility[0, left_ankle] = 1.0
     visibility[0, right_ankle] = 1.0
 
     prediction = target.clone()
+    loss = bilateral_cross_peak_loss(prediction, target, visibility, minimum_target_distance=3.0)
+    assert float(loss.item()) == 0.0
+
+
+def test_bilateral_loss_ignores_negative_zero_targets():
+    target = torch.zeros((1, NUM_KEYPOINTS, 16, 16), dtype=torch.float32)
+    supervision = torch.ones((1, NUM_KEYPOINTS, 1, 1), dtype=torch.float32)
+    prediction = torch.full_like(target, 0.2)
+
     loss = bilateral_cross_peak_loss(
         prediction,
         target,
-        visibility,
+        supervision,
         minimum_target_distance=3.0,
     )
-
     assert float(loss.item()) == 0.0
