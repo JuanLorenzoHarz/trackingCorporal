@@ -1,64 +1,43 @@
 # trackingCorporal
 
-Projeto experimental de tracking corporal 2D em tempo real a partir de vídeo de webcam.
-
-## Status
-
-**WIP — Fase 1.**
-
-O pipeline atual possui captura de webcam, CNN própria por heatmaps, pré-processamento sem distorção, resolução bilateral de pernas, filtro de plausibilidade, tracking temporal e suavização.
-
-## Escopo inicial
-
-- uma webcam RGB;
-- uma pessoa por vez;
-- corpo inteiro em 2D;
-- 17 keypoints COCO;
-- esqueleto virtual;
-- tracking temporal e suavização;
-- previsão curta de articulações ocultas;
-- classificação futura das mãos em `OPEN`, `CLOSED` ou `UNKNOWN`.
+Projeto experimental de tracking corporal 2D em tempo real a partir de webcam.
 
 ## Pipeline atual
 
 ```text
 webcam
-  -> recorte quadrado sem distorção
-  -> PoseNet
-  -> 17 heatmaps
-  -> decoder com múltiplas hipóteses L/R para joelhos/tornozelos
-  -> estabilização temporal da identidade das pernas
-  -> plausibilidade anatômica/temporal
-  -> tracking de oclusões
-  -> smoothing
-  -> renderer
+ -> recorte quadrado sem distorção
+ -> PoseNet
+ -> decoder conservador por qualidade de pico
+ -> gate de presença corporal
+ -> identidade esquerda/direita por par
+ -> plausibilidade anatômica
+ -> tracking temporal / oclusão curta
+ -> smoothing
+ -> renderer
 ```
 
-A resolução bilateral tenta evitar que os canais esquerdo e direito colapsem sobre a mesma perna. Quando os maiores picos de joelho/tornozelo ficam juntos, o decoder verifica a segunda e terceira máximas locais e só escolhe uma alternativa quando sua confiança continua próxima do pico principal. Em seguida, o tracker bilateral usa o histórico para reduzir trocas de identidade entre esquerda e direita.
+A inferência padrão segue a regra **na dúvida, não inventar**. Picos secundários não são promovidos automaticamente; o modo experimental antigo continua disponível por `--enable-bilateral-multipeak`.
 
-## Testes
+O gate de presença exige alguns frames com tronco e keypoints coerentes antes de liberar o esqueleto. Quando a pessoa desaparece por tempo suficiente, histórico anatômico, bilateral e smoothing são resetados.
 
-```powershell
-python -m pytest -v
-```
-
-## Webcam
+## Testar webcam
 
 ```powershell
 python -m src.main --mode model
 ```
 
-O overlay mostra FPS, plausibilidade geral, plausibilidade das pernas, consistência L/R, correções de picos, colapsos detectados, trocas de identidade, keypoints rejeitados/previstos e calibração anatômica.
+Para comparar com a promoção experimental de segundo/terceiro pico:
 
-## Fine-tuning focado em pernas
+```powershell
+python -m src.main --mode model --enable-bilateral-multipeak
+```
 
-O treino suporta três mecanismos complementares:
+## Treino com negativos
 
-- `--heatmap-positive-weight`: dá mais peso ao pico da articulação;
-- `--leg-keypoint-weight`: aumenta a importância de quadris, joelhos e tornozelos;
-- `--bilateral-loss-weight`: penaliza resposta do canal esquerdo sobre o target direito e vice-versa quando os targets estão claramente separados.
+Os primeiros treinos usavam apenas recortes contendo pessoas. A rede, portanto, nunca aprendia explicitamente que uma imagem podia não conter pose. O dataset agora pode gerar recortes de fundo quase sem interseção com pessoas anotadas e supervisionar os 17 heatmaps para zero.
 
-Exemplo:
+Exemplo de fine-tuning conservador:
 
 ```powershell
 python -m scripts.train_pose `
@@ -67,28 +46,25 @@ python -m scripts.train_pose `
   --batch-size 8 `
   --epochs 0 `
   --max-hours 6 `
-  --learning-rate 0.00015 `
+  --learning-rate 0.00008 `
   --resume models/pose_model.pt `
   --output models/pose_model.pt `
   --heatmap-positive-weight 8 `
-  --leg-keypoint-weight 2.0 `
-  --bilateral-loss-weight 0.02 `
+  --leg-keypoint-weight 1.5 `
+  --bilateral-loss-weight 0.01 `
   --bilateral-min-target-distance 3 `
-  --occlusion-probability 0.30 `
+  --negative-sample-probability 0.15 `
+  --negative-max-person-overlap 0.01 `
+  --occlusion-probability 0.20 `
   --occlusion-min-size 0.12 `
   --occlusion-max-size 0.30 `
   --log-every 50
 ```
 
-A loss bilateral não força esquerda/direita a permanecerem em lados fixos da tela. Ela só entra quando o ground truth possui os dois pontos suficientemente separados.
+## Testes
 
-## Tecnologias
+```powershell
+python -m pytest -v
+```
 
-- Python;
-- PyTorch;
-- OpenCV;
-- NumPy;
-- PyYAML;
-- pytest.
-
-A intenção do projeto é construir e entender o pipeline principal sem depender de soluções completas como MediaPipe, OpenPose, MMPose, MoveNet ou YOLO-Pose.
+A arquitetura continua sendo a PoseNet própria do projeto; nenhuma solução pronta de pose foi introduzida.
