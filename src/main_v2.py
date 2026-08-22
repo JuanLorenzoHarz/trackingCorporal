@@ -22,9 +22,27 @@ WINDOW_NAME = "trackingCorporal V2"
 
 
 def load_model_v2(path: str | Path, device: torch.device) -> tuple[PoseNetV2, int]:
-    checkpoint = torch.load(path, map_location=device, weights_only=True)
+    checkpoint_path = Path(path)
+    if not checkpoint_path.is_file():
+        smoke_path = Path("models/pose_model_v2_smoke.pt")
+        hint = ""
+        if smoke_path.is_file():
+            hint = (
+                "\nO checkpoint smoke existe. Para testá-lo use: "
+                "python -m src.main_v2 --weights models/pose_model_v2_smoke.pt"
+            )
+        raise FileNotFoundError(
+            f"Checkpoint V2 não encontrado: {checkpoint_path.resolve()}.{hint}"
+        )
+
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
     if not isinstance(checkpoint, dict) or checkpoint.get("architecture") != "PoseNetV2":
-        raise RuntimeError("Checkpoint informado não é PoseNetV2.")
+        raise RuntimeError(
+            f"Checkpoint informado não é PoseNetV2: {checkpoint_path.resolve()}"
+        )
+    if "model_state" not in checkpoint:
+        raise RuntimeError("Checkpoint V2 inválido: model_state não encontrado.")
+
     model = PoseNetV2().to(device)
     model.load_state_dict(checkpoint["model_state"])
     model.eval()
