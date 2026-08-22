@@ -1,8 +1,8 @@
 """COCO full-frame para treinamento multi-pessoa da PoseNet V2.
 
-Diferente da V1, cada exemplo é a imagem inteira. Todas as pessoas anotadas no
-frame contribuem para os mesmos mapas, inclusive imagens sem pessoa utilizável,
-que viram negativos naturais para o mapa de centros e keypoints.
+Cada exemplo é a imagem inteira. Todas as pessoas anotadas contribuem para os
+mesmos mapas; imagens sem pessoa utilizável viram negativos naturais. O flip
+horizontal troca também a semântica left/right e o sinal X dos vetores.
 """
 
 from __future__ import annotations
@@ -17,7 +17,14 @@ import torch
 from torch.utils.data import Dataset
 
 from src.pose.keypoints import NUM_KEYPOINTS
-from src.pose.structure_v2 import PARENT_BY_KEYPOINT
+from src.pose.structure_v2 import BILATERAL_PAIRS, PARENT_BY_KEYPOINT
+
+
+FLIP_PAIRS: tuple[tuple[int, int], ...] = (
+    (1, 2),  # eyes
+    (3, 4),  # ears
+    *BILATERAL_PAIRS,
+)
 
 
 class CocoMultiPersonPoseDataset(Dataset):
@@ -32,6 +39,8 @@ class CocoMultiPersonPoseDataset(Dataset):
         max_samples: int | None = None,
         center_sigma: float = 2.0,
         keypoint_sigma: float = 1.8,
+        horizontal_flip_probability: float = 0.5,
+        augmentation_seed: int | None = None,
     ) -> None:
         self.images_dir = Path(images_dir)
         self.annotations_file = Path(annotations_file)
@@ -41,13 +50,15 @@ class CocoMultiPersonPoseDataset(Dataset):
         self.max_people = max_people
         self.center_sigma = center_sigma
         self.keypoint_sigma = keypoint_sigma
+        self.horizontal_flip_probability = horizontal_flip_probability
+        self._rng = np.random.default_rng(augmentation_seed)
 
+        if not 0.0 <= horizontal_flip_probability <= 1.0:
+            raise ValueError("horizontal_flip_probability deve estar entre 0 e 1.")
         if not self.images_dir.is_dir():
             raise FileNotFoundError(f"Pasta COCO não encontrada: {self.images_dir}")
         if not self.annotations_file.is_file():
-            raise FileNotFoundError(
-                f"Anotações COCO não encontradas: {self.annotations_file}"
-            )
+            raise FileNotFoundError(f"Anotações COCO não encontradas: {self.annotations_file}")
         if input_size <= 0 or heatmap_size <= 1:
             raise ValueError("input_size/heatmap_size inválidos.")
         if max_people < 1:
@@ -101,8 +112,6 @@ class CocoMultiPersonPoseDataset(Dataset):
 
         targets = self._empty_targets()
         annotations = self.annotations_by_image.get(int(info["id"]), [])
-
-        # Pessoas maiores primeiro tornam colisões raras de offsets mais estáveis.
         annotations = sorted(
             annotations,
             key=lambda ann: float(ann["bbox"][2]) * float(ann["bbox"][3]),
@@ -110,13 +119,11 @@ class CocoMultiPersonPoseDataset(Dataset):
         )[: self.max_people]
 
         for annotation in annotations:
-            self._add_person_targets(
-                targets,
-                annotation,
-                scale=scale,
-                pad_x=pad_x,
-                pad_y=pad_y,
-            )
+            self._add_person_targets(targets, annotation, scale, pad_x, pad_y)
+
+        if self._rng.random() < self.horizontal_flip_probability:
+            image_tensor = torch.flip(image_tensor, dims=(2,))
+            targets = self._flip_targets(targets)
 
         return image_tensor, targets
 
@@ -125,12 +132,7 @@ class CocoMultiPersonPoseDataset(Dataset):
         scale = min(self.input_size / width, self.input_size / height)
         resized_width = max(1, int(round(width * scale)))
         resized_height = max(1, int(round(height * scale)))
-        resized = cv2.resize(
-            image,
-            (resized_width, resized_height),
-            interpolation=cv2.INTER_LINEAR,
-        )
-
+        resized = cv2.resize(image, (resized_width, resized_height), interpolation=cv2.INTER_LINEAR)
         canvas = np.zeros((self.input_size, self.input_size, 3), dtype=np.uint8)
         left = (self.input_size - resized_width) // 2
         top = (self.input_size - resized_height) // 2
@@ -161,27 +163,16 @@ class CocoMultiPersonPoseDataset(Dataset):
         center_input_x = (x + width * 0.5) * scale + pad_x
         center_input_y = (y + height * 0.5) * scale + pad_y
         center_x, center_y = self._input_to_heatmap(center_input_x, center_input_y)
-
         if not self._inside_heatmap(center_x, center_y):
             return
-        self._draw_gaussian(
-            targets["center"][0],
-            center_x,
-            center_y,
-            self.center_sigma,
-        )
+        self._draw_gaussian(targets["center"][0], center_x, center_y, self.center_sigma)
 
-        keypoints = np.asarray(annotation["keypoints"], dtype=np.float32).reshape(
-            NUM_KEYPOINTS, 3
-        )
+        keypoints = np.asarray(annotation["keypoints"], dtype=np.float32).reshape(NUM_KEYPOINTS, 3)
         transformed: list[tuple[float, float] | None] = [None] * NUM_KEYPOINTS
-
         for index, (px, py, visibility) in enumerate(keypoints):
             if visibility <= 0:
                 continue
-            input_x = float(px) * scale + pad_x
-            input_y = float(py) * scale + pad_y
-            hx, hy = self._input_to_heatmap(input_x, input_y)
+            hx, hy = self._input_to_heatmap(float(px) * scale + pad_x, float(py) * scale + pad_y)
             if self._inside_heatmap(hx, hy):
                 transformed[index] = (hx, hy)
 
@@ -189,20 +180,11 @@ class CocoMultiPersonPoseDataset(Dataset):
             if point is None:
                 continue
             hx, hy = point
-            self._draw_gaussian(
-                targets["keypoints"][keypoint_index],
-                hx,
-                hy,
-                self.keypoint_sigma,
-            )
-
-            ix = int(round(hx))
-            iy = int(round(hy))
+            self._draw_gaussian(targets["keypoints"][keypoint_index], hx, hy, self.keypoint_sigma)
+            ix, iy = int(round(hx)), int(round(hy))
             if not (0 <= ix < self.heatmap_size and 0 <= iy < self.heatmap_size):
                 continue
 
-            # Se dois pontos semânticos do mesmo tipo caírem exatamente na mesma
-            # célula, mantemos o primeiro (pessoa maior, pela ordenação acima).
             if targets["center_offset_mask"][keypoint_index, iy, ix] <= 0:
                 targets["center_offsets"][2 * keypoint_index, iy, ix] = center_x - hx
                 targets["center_offsets"][2 * keypoint_index + 1, iy, ix] = center_y - hy
@@ -217,20 +199,37 @@ class CocoMultiPersonPoseDataset(Dataset):
                 targets["parent_offsets"][2 * keypoint_index + 1, iy, ix] = parent_y - hy
                 targets["parent_offset_mask"][keypoint_index, iy, ix] = 1.0
 
+    def _flip_targets(self, targets: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        result = {name: torch.flip(tensor.clone(), dims=(-1,)) for name, tensor in targets.items()}
+        result["center"] = torch.flip(targets["center"].clone(), dims=(-1,))
+
+        for name in ("keypoints", "center_offset_mask", "parent_offset_mask"):
+            tensor = result[name]
+            for left, right in FLIP_PAIRS:
+                left_copy = tensor[left].clone()
+                tensor[left] = tensor[right]
+                tensor[right] = left_copy
+
+        for name in ("center_offsets", "parent_offsets"):
+            tensor = result[name].view(NUM_KEYPOINTS, 2, self.heatmap_size, self.heatmap_size)
+            for left, right in FLIP_PAIRS:
+                left_copy = tensor[left].clone()
+                tensor[left] = tensor[right]
+                tensor[right] = left_copy
+            tensor[:, 0].mul_(-1.0)
+            result[name] = tensor.view(NUM_KEYPOINTS * 2, self.heatmap_size, self.heatmap_size)
+
+        return result
+
     def _input_to_heatmap(self, x: float, y: float) -> tuple[float, float]:
-        scale = (self.heatmap_size - 1) / max(self.input_size - 1, 1)
-        return x * scale, y * scale
+        factor = (self.heatmap_size - 1) / max(self.input_size - 1, 1)
+        return x * factor, y * factor
 
     def _inside_heatmap(self, x: float, y: float) -> bool:
         return 0.0 <= x <= self.heatmap_size - 1 and 0.0 <= y <= self.heatmap_size - 1
 
     @staticmethod
-    def _draw_gaussian(
-        heatmap: torch.Tensor,
-        center_x: float,
-        center_y: float,
-        sigma: float,
-    ) -> None:
+    def _draw_gaussian(heatmap: torch.Tensor, center_x: float, center_y: float, sigma: float) -> None:
         height, width = heatmap.shape
         radius = max(1, int(round(sigma * 3.0)))
         left = max(0, int(center_x) - radius)
@@ -239,7 +238,6 @@ class CocoMultiPersonPoseDataset(Dataset):
         bottom = min(height, int(center_y) + radius + 1)
         if left >= right or top >= bottom:
             return
-
         ys = torch.arange(top, bottom, dtype=heatmap.dtype)
         xs = torch.arange(left, right, dtype=heatmap.dtype)
         grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
@@ -247,7 +245,4 @@ class CocoMultiPersonPoseDataset(Dataset):
             -((grid_x - center_x).square() + (grid_y - center_y).square())
             / (2.0 * sigma * sigma)
         )
-        heatmap[top:bottom, left:right] = torch.maximum(
-            heatmap[top:bottom, left:right],
-            gaussian,
-        )
+        heatmap[top:bottom, left:right] = torch.maximum(heatmap[top:bottom, left:right], gaussian)
