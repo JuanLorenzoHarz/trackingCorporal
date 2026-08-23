@@ -150,3 +150,54 @@ def test_v2_parent_offsets_prevent_crossed_wrist_x():
     assert left_wrist.x < 0.5
     assert left_wrist.x < left_elbow.x + 0.05
     assert right_wrist.x > 0.5
+
+
+def test_v2_profile_keeps_close_left_right_pairs():
+    """Perfil real pode projetar L/R quase no mesmo X sem ser um erro."""
+    output = _empty_output()
+    cx, cy = 32, 32
+    output["center"][0, 0, cy, cx] = 8.0
+
+    _put_keypoint(output, BodyKeypoint.NOSE, 32, 18, cx, cy)
+
+    # Ombros quase sobrepostos, situação comum em perfil.
+    _put_keypoint(output, BodyKeypoint.LEFT_SHOULDER, 31, 27, cx, cy)
+    _put_keypoint(output, BodyKeypoint.RIGHT_SHOULDER, 32, 27, cx, cy)
+
+    # Cotovelos também próximos, mas cada um aponta corretamente para seu ombro.
+    _put_keypoint(
+        output,
+        BodyKeypoint.LEFT_ELBOW,
+        31,
+        36,
+        cx,
+        cy,
+        parent_x=31,
+        parent_y=27,
+    )
+    _put_keypoint(
+        output,
+        BodyKeypoint.RIGHT_ELBOW,
+        32,
+        36,
+        cx,
+        cy,
+        parent_x=32,
+        parent_y=27,
+    )
+
+    poses, report = decode_pose_v2(
+        output,
+        center_threshold=0.5,
+        keypoint_threshold=0.2,
+        association_radius=3.0,
+        bilateral_min_separation=2.0,
+    )
+
+    assert report.person_count == 1
+    assert report.rejected_bilateral_points == 0
+    pose = poses[0]
+    assert pose[int(BodyKeypoint.LEFT_SHOULDER)].confidence > 0.0
+    assert pose[int(BodyKeypoint.RIGHT_SHOULDER)].confidence > 0.0
+    assert pose[int(BodyKeypoint.LEFT_ELBOW)].confidence > 0.0
+    assert pose[int(BodyKeypoint.RIGHT_ELBOW)].confidence > 0.0
