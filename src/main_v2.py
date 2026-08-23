@@ -189,7 +189,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--camera", type=int, default=0)
     parser.add_argument("--width", type=int, default=640)
     parser.add_argument("--height", type=int, default=480)
-    parser.add_argument("--center-threshold", type=float, default=0.30)
+    parser.add_argument(
+        "--center-threshold",
+        type=float,
+        default=0.20,
+        help="Limiar do centro de pessoa. Perfil pode produzir centros menos intensos.",
+    )
     parser.add_argument("--keypoint-threshold", type=float, default=0.12)
     parser.add_argument("--render-confidence", type=float, default=0.10)
     parser.add_argument("--max-people", type=int, default=6)
