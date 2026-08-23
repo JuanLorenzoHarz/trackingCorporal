@@ -5,8 +5,10 @@ A associação ocorre em duas etapas:
 2. quando existe pai anatômico, parent_offsets mede se o candidato realmente se
    conecta ao ombro/cotovelo/quadril/joelho correto.
 
-Essa segunda etapa foi criada especialmente para reduzir os "X" de braços e
-pernas causados por troca de punhos e tornozelos.
+A proteção anti-X não assume mais que pares L/R próximos são necessariamente
+errados. Em perfil, ombros, braços e pernas podem se sobrepor naturalmente na
+projeção 2D. Um ponto só é removido quando, além da proximidade, a geometria da
+cadeia indica que a associação cruzada é claramente mais coerente que a direta.
 """
 
 from __future__ import annotations
@@ -19,7 +21,12 @@ from torch.nn import functional as F
 
 from src.core.types import Keypoint, Pose
 from src.pose.keypoints import NUM_KEYPOINTS
-from src.pose.structure_v2 import BILATERAL_PAIRS, DECODE_ORDER, EXTREMITY_INDICES, PARENT_BY_KEYPOINT
+from src.pose.structure_v2 import (
+    BILATERAL_PAIRS,
+    DECODE_ORDER,
+    EXTREMITY_INDICES,
+    PARENT_BY_KEYPOINT,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -149,16 +156,27 @@ def decode_pose_v2(
 
             selected[keypoint_index] = best
 
-        # Se L/R ainda colapsarem no mesmo local, é mais seguro remover o lado
-        # menos coerente do que desenhar uma conexão cruzada inventada.
+        # Perfil-safe: proximidade L/R por si só NÃO é erro. Ombros, quadris,
+        # joelhos etc. podem se sobrepor quando a pessoa gira de lado. Só
+        # rejeitamos um lado se a cadeia parecer realmente cruzada em relação
+        # aos pais semânticos (ex.: punho esquerdo geometricamente ligado ao
+        # cotovelo direito e vice-versa).
         for left_index, right_index in BILATERAL_PAIRS:
             left = selected[left_index]
             right = selected[right_index]
             if left is None or right is None:
                 continue
+
             separation = hypot(left[0].x - right[0].x, left[0].y - right[0].y)
             if separation >= bilateral_min_separation:
                 continue
+            if not _pair_geometry_is_crossed(
+                selected,
+                left_index=left_index,
+                right_index=right_index,
+            ):
+                continue
+
             if left[1] >= right[1]:
                 selected[right_index] = None
             else:
@@ -191,6 +209,58 @@ def decode_pose_v2(
         assigned_candidates=assigned_candidates,
         rejected_bilateral_points=rejected_bilateral_points,
     )
+
+
+def _pair_geometry_is_crossed(
+    selected: list[tuple[_Candidate, float] | None],
+    left_index: int,
+    right_index: int,
+) -> bool:
+    """Distingue um X real de sobreposição L/R causada por pose de perfil.
+
+    Para pares sem pai (ombros/quadris) a proximidade é sempre permitida. Para
+    cotovelos, punhos, joelhos e tornozelos comparamos o custo geométrico da
+    cadeia direta contra a cadeia trocada. Em perfil os custos tendem a ficar
+    próximos; em um X verdadeiro a ligação cruzada fica claramente menor.
+    """
+    left_parent_index = PARENT_BY_KEYPOINT[left_index]
+    right_parent_index = PARENT_BY_KEYPOINT[right_index]
+    if left_parent_index < 0 or right_parent_index < 0:
+        return False
+
+    left = selected[left_index]
+    right = selected[right_index]
+    left_parent = selected[left_parent_index]
+    right_parent = selected[right_parent_index]
+    if left is None or right is None or left_parent is None or right_parent is None:
+        return False
+
+    left_candidate = left[0]
+    right_candidate = right[0]
+    left_parent_candidate = left_parent[0]
+    right_parent_candidate = right_parent[0]
+
+    direct_cost = hypot(
+        left_candidate.x - left_parent_candidate.x,
+        left_candidate.y - left_parent_candidate.y,
+    ) + hypot(
+        right_candidate.x - right_parent_candidate.x,
+        right_candidate.y - right_parent_candidate.y,
+    )
+    crossed_cost = hypot(
+        left_candidate.x - right_parent_candidate.x,
+        left_candidate.y - right_parent_candidate.y,
+    ) + hypot(
+        right_candidate.x - left_parent_candidate.x,
+        right_candidate.y - left_parent_candidate.y,
+    )
+
+    parent_separation = hypot(
+        left_parent_candidate.x - right_parent_candidate.x,
+        left_parent_candidate.y - right_parent_candidate.y,
+    )
+    margin = max(0.50, parent_separation * 0.10)
+    return crossed_cost + margin < direct_cost and crossed_cost < direct_cost * 0.80
 
 
 def _single_batch(tensor: torch.Tensor) -> torch.Tensor:
