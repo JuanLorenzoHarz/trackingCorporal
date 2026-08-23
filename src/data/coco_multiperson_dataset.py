@@ -3,6 +3,11 @@
 Cada exemplo é a imagem inteira. Todas as pessoas anotadas contribuem para os
 mesmos mapas; imagens sem pessoa utilizável viram negativos naturais. O flip
 horizontal troca também a semântica left/right e o sinal X dos vetores.
+
+Opcionalmente, uma compressão horizontal moderada da cena cria exemplos de
+silhueta estreita para aumentar a robustez a pessoas meio ou completamente de
+perfil. A transformação é aplicada à imagem e a todos os targets de forma
+consistente.
 """
 
 from __future__ import annotations
@@ -40,6 +45,9 @@ class CocoMultiPersonPoseDataset(Dataset):
         center_sigma: float = 2.0,
         keypoint_sigma: float = 1.8,
         horizontal_flip_probability: float = 0.5,
+        profile_squeeze_probability: float = 0.30,
+        profile_squeeze_min: float = 0.60,
+        profile_squeeze_max: float = 0.88,
         augmentation_seed: int | None = None,
     ) -> None:
         self.images_dir = Path(images_dir)
@@ -51,10 +59,19 @@ class CocoMultiPersonPoseDataset(Dataset):
         self.center_sigma = center_sigma
         self.keypoint_sigma = keypoint_sigma
         self.horizontal_flip_probability = horizontal_flip_probability
+        self.profile_squeeze_probability = profile_squeeze_probability
+        self.profile_squeeze_min = profile_squeeze_min
+        self.profile_squeeze_max = profile_squeeze_max
         self._rng = np.random.default_rng(augmentation_seed)
 
         if not 0.0 <= horizontal_flip_probability <= 1.0:
             raise ValueError("horizontal_flip_probability deve estar entre 0 e 1.")
+        if not 0.0 <= profile_squeeze_probability <= 1.0:
+            raise ValueError("profile_squeeze_probability deve estar entre 0 e 1.")
+        if not 0.0 < profile_squeeze_min <= profile_squeeze_max <= 1.0:
+            raise ValueError(
+                "profile_squeeze_min/max devem satisfazer 0 < min <= max <= 1."
+            )
         if not self.images_dir.is_dir():
             raise FileNotFoundError(f"Pasta COCO não encontrada: {self.images_dir}")
         if not self.annotations_file.is_file():
@@ -102,6 +119,12 @@ class CocoMultiPersonPoseDataset(Dataset):
             raise RuntimeError(f"Não foi possível ler: {image_path}")
 
         canvas, scale, pad_x, pad_y = self._letterbox(image)
+
+        profile_scale_x = 1.0
+        profile_pad_x = 0.0
+        if self._rng.random() < self.profile_squeeze_probability:
+            canvas, profile_scale_x, profile_pad_x = self._apply_profile_squeeze(canvas)
+
         rgb = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)
         image_tensor = (
             torch.from_numpy(np.ascontiguousarray(rgb))
@@ -119,7 +142,15 @@ class CocoMultiPersonPoseDataset(Dataset):
         )[: self.max_people]
 
         for annotation in annotations:
-            self._add_person_targets(targets, annotation, scale, pad_x, pad_y)
+            self._add_person_targets(
+                targets,
+                annotation,
+                scale,
+                pad_x,
+                pad_y,
+                profile_scale_x=profile_scale_x,
+                profile_pad_x=profile_pad_x,
+            )
 
         if self._rng.random() < self.horizontal_flip_probability:
             image_tensor = torch.flip(image_tensor, dims=(2,))
@@ -138,6 +169,26 @@ class CocoMultiPersonPoseDataset(Dataset):
         top = (self.input_size - resized_height) // 2
         canvas[top : top + resized_height, left : left + resized_width] = resized
         return canvas, scale, float(left), float(top)
+
+    def _apply_profile_squeeze(self, image: np.ndarray) -> tuple[np.ndarray, float, float]:
+        """Comprime a cena horizontalmente para simular silhuetas mais de perfil."""
+        factor = float(
+            self._rng.uniform(self.profile_squeeze_min, self.profile_squeeze_max)
+        )
+        new_width = max(2, int(round(self.input_size * factor)))
+        resized = cv2.resize(
+            image,
+            (new_width, self.input_size),
+            interpolation=cv2.INTER_LINEAR,
+        )
+        result = np.zeros_like(image)
+        left = (self.input_size - new_width) // 2
+        result[:, left : left + new_width] = resized
+
+        # Mapeamento das coordenadas de pixels do canvas original para o canvas
+        # comprimido. Usamos extremos 0..W-1 para alinhar com os heatmaps.
+        scale_x = (new_width - 1) / max(self.input_size - 1, 1)
+        return result, float(scale_x), float(left)
 
     def _empty_targets(self) -> dict[str, torch.Tensor]:
         h = self.heatmap_size
@@ -158,9 +209,14 @@ class CocoMultiPersonPoseDataset(Dataset):
         scale: float,
         pad_x: float,
         pad_y: float,
+        profile_scale_x: float = 1.0,
+        profile_pad_x: float = 0.0,
     ) -> None:
         x, y, width, height = [float(value) for value in annotation["bbox"]]
-        center_input_x = (x + width * 0.5) * scale + pad_x
+        center_input_x = (
+            ((x + width * 0.5) * scale + pad_x) * profile_scale_x
+            + profile_pad_x
+        )
         center_input_y = (y + height * 0.5) * scale + pad_y
         center_x, center_y = self._input_to_heatmap(center_input_x, center_input_y)
         if not self._inside_heatmap(center_x, center_y):
@@ -172,7 +228,9 @@ class CocoMultiPersonPoseDataset(Dataset):
         for index, (px, py, visibility) in enumerate(keypoints):
             if visibility <= 0:
                 continue
-            hx, hy = self._input_to_heatmap(float(px) * scale + pad_x, float(py) * scale + pad_y)
+            input_x = (float(px) * scale + pad_x) * profile_scale_x + profile_pad_x
+            input_y = float(py) * scale + pad_y
+            hx, hy = self._input_to_heatmap(input_x, input_y)
             if self._inside_heatmap(hx, hy):
                 transformed[index] = (hx, hy)
 
