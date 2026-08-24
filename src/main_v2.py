@@ -65,12 +65,14 @@ def draw_status(
     person_count: int,
     assigned_candidates: int,
     rejected_bilateral: int,
+    suppressed_duplicates: int,
 ) -> None:
     lines = (
         "POSENET V2 - MULTI-PESSOA",
         f"FPS: {fps:.1f}",
         f"Pessoas: {person_count}",
         f"Candidatos associados: {assigned_candidates}",
+        f"Duplicatas de pessoa fundidas: {suppressed_duplicates}",
         f"L/R rejeitados para evitar X: {rejected_bilateral}",
         "Q ou ESC para sair",
     )
@@ -110,8 +112,8 @@ def main(args: argparse.Namespace | None = None) -> None:
 
     print(f"PoseNet V2 carregada em {device}.")
     print(
-        "A V2 usa full-frame letterbox, centros de pessoa, associação keypoint->centro "
-        "e keypoint->pai anatômico."
+        "A V2 usa full-frame letterbox, centros de pessoa, associação keypoint->centro, "
+        "keypoint->pai anatômico e fusão de duplicatas por sobreposição semântica."
     )
 
     previous_time = time.perf_counter()
@@ -138,9 +140,14 @@ def main(args: argparse.Namespace | None = None) -> None:
                     max_people=args.max_people,
                     candidates_per_keypoint=args.candidates_per_keypoint,
                     association_radius=args.association_radius,
+                    limb_association_factor=args.limb_association_factor,
+                    extremity_association_factor=args.extremity_association_factor,
                     parent_sigma=args.parent_sigma,
                     extremity_parent_sigma=args.extremity_parent_sigma,
                     bilateral_min_separation=args.bilateral_min_separation,
+                    duplicate_center_radius=args.duplicate_center_radius,
+                    duplicate_joint_distance=args.duplicate_joint_distance,
+                    duplicate_overlap_ratio=args.duplicate_overlap_ratio,
                 )
                 original_poses = [transform.pose_to_original(pose) for pose in crop_poses]
                 people = tracker.update(original_poses)
@@ -174,6 +181,7 @@ def main(args: argparse.Namespace | None = None) -> None:
                     person_count=len(people),
                     assigned_candidates=report.assigned_candidates,
                     rejected_bilateral=report.rejected_bilateral_points,
+                    suppressed_duplicates=report.suppressed_duplicate_people,
                 )
                 cv2.imshow(WINDOW_NAME, frame)
                 key = cv2.waitKey(1) & 0xFF
@@ -200,9 +208,39 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-people", type=int, default=6)
     parser.add_argument("--candidates-per-keypoint", type=int, default=12)
     parser.add_argument("--association-radius", type=float, default=7.0)
+    parser.add_argument(
+        "--limb-association-factor",
+        type=float,
+        default=1.30,
+        help="Multiplicador do raio para cotovelos/joelhos.",
+    )
+    parser.add_argument(
+        "--extremity-association-factor",
+        type=float,
+        default=1.65,
+        help="Multiplicador do raio para punhos/tornozelos.",
+    )
     parser.add_argument("--parent-sigma", type=float, default=4.0)
-    parser.add_argument("--extremity-parent-sigma", type=float, default=2.5)
+    parser.add_argument(
+        "--extremity-parent-sigma",
+        type=float,
+        default=4.0,
+        help="Tolerância do vetor punho->cotovelo / tornozelo->joelho.",
+    )
     parser.add_argument("--bilateral-min-separation", type=float, default=1.5)
+    parser.add_argument(
+        "--duplicate-center-radius",
+        type=float,
+        default=6.0,
+        help="Distância máxima entre centros candidatos à fusão; não funde sem sobreposição de keypoints.",
+    )
+    parser.add_argument(
+        "--duplicate-joint-distance",
+        type=float,
+        default=0.05,
+        help="Distância normalizada para considerar dois keypoints semânticos sobrepostos.",
+    )
+    parser.add_argument("--duplicate-overlap-ratio", type=float, default=0.60)
     parser.add_argument("--track-match-distance", type=float, default=0.22)
     parser.add_argument("--track-stale-frames", type=int, default=5)
     parser.add_argument("--prediction-frames", type=int, default=6)
