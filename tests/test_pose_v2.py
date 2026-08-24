@@ -102,12 +102,10 @@ def test_v2_parent_offsets_prevent_crossed_wrist_x():
     cx, cy = 32, 32
     output["center"][0, 0, cy, cx] = 8.0
 
-    # Âncoras para materializar a pessoa.
     _put_keypoint(output, BodyKeypoint.NOSE, 32, 18, cx, cy)
     _put_keypoint(output, BodyKeypoint.LEFT_SHOULDER, 23, 26, cx, cy)
     _put_keypoint(output, BodyKeypoint.RIGHT_SHOULDER, 41, 26, cx, cy)
 
-    # Cotovelos corretos.
     _put_keypoint(
         output, BodyKeypoint.LEFT_ELBOW, 19, 34, cx, cy,
         parent_x=23, parent_y=26,
@@ -117,8 +115,6 @@ def test_v2_parent_offsets_prevent_crossed_wrist_x():
         parent_x=41, parent_y=26,
     )
 
-    # LEFT_WRIST possui um pico MAIS FORTE no lado errado, mas esse pico aponta
-    # para o cotovelo direito. O pico correto é menor e aponta para o cotovelo esquerdo.
     _put_keypoint(
         output, BodyKeypoint.LEFT_WRIST, 48, 42, cx, cy,
         logit=9.0, parent_x=45, parent_y=34,
@@ -159,12 +155,8 @@ def test_v2_profile_keeps_close_left_right_pairs():
     output["center"][0, 0, cy, cx] = 8.0
 
     _put_keypoint(output, BodyKeypoint.NOSE, 32, 18, cx, cy)
-
-    # Ombros quase sobrepostos, situação comum em perfil.
     _put_keypoint(output, BodyKeypoint.LEFT_SHOULDER, 31, 27, cx, cy)
     _put_keypoint(output, BodyKeypoint.RIGHT_SHOULDER, 32, 27, cx, cy)
-
-    # Cotovelos também próximos, mas cada um aponta corretamente para seu ombro.
     _put_keypoint(
         output,
         BodyKeypoint.LEFT_ELBOW,
@@ -201,3 +193,113 @@ def test_v2_profile_keeps_close_left_right_pairs():
     assert pose[int(BodyKeypoint.RIGHT_SHOULDER)].confidence > 0.0
     assert pose[int(BodyKeypoint.LEFT_ELBOW)].confidence > 0.0
     assert pose[int(BodyKeypoint.RIGHT_ELBOW)].confidence > 0.0
+
+
+def test_v2_fuses_two_centers_that_decode_the_same_person():
+    output = _empty_output()
+    center_a = (30, 32)
+    center_b = (34, 32)
+    output["center"][0, 0, center_a[1], center_a[0]] = 9.0
+    output["center"][0, 0, center_b[1], center_b[0]] = 8.5
+
+    for cx, shift in ((center_a[0], 0), (center_b[0], 2)):
+        _put_keypoint(output, BodyKeypoint.NOSE, 30 + shift, 18, cx, 32)
+        _put_keypoint(output, BodyKeypoint.LEFT_SHOULDER, 26 + shift, 27, cx, 32)
+        _put_keypoint(output, BodyKeypoint.RIGHT_SHOULDER, 34 + shift, 27, cx, 32)
+        _put_keypoint(output, BodyKeypoint.LEFT_HIP, 27 + shift, 39, cx, 32)
+        _put_keypoint(output, BodyKeypoint.RIGHT_HIP, 33 + shift, 39, cx, 32)
+
+    poses, report = decode_pose_v2(
+        output,
+        center_threshold=0.5,
+        keypoint_threshold=0.2,
+        association_radius=4.0,
+        duplicate_center_radius=6.0,
+        duplicate_joint_distance=0.05,
+    )
+
+    assert len(poses) == 1
+    assert report.person_count == 1
+    assert report.suppressed_duplicate_people == 1
+
+
+def test_v2_keeps_two_nearby_people_when_semantic_joints_do_not_overlap():
+    output = _empty_output()
+    center_a = (29, 32)
+    center_b = (35, 32)
+    output["center"][0, 0, center_a[1], center_a[0]] = 9.0
+    output["center"][0, 0, center_b[1], center_b[0]] = 8.8
+
+    # Centros são próximos, mas os esqueletos ocupam regiões diferentes.
+    for cx, base_x in ((center_a[0], 20), (center_b[0], 40)):
+        _put_keypoint(output, BodyKeypoint.NOSE, base_x, 18, cx, 32)
+        _put_keypoint(output, BodyKeypoint.LEFT_SHOULDER, base_x - 3, 27, cx, 32)
+        _put_keypoint(output, BodyKeypoint.RIGHT_SHOULDER, base_x + 3, 27, cx, 32)
+        _put_keypoint(output, BodyKeypoint.LEFT_HIP, base_x - 2, 39, cx, 32)
+        _put_keypoint(output, BodyKeypoint.RIGHT_HIP, base_x + 2, 39, cx, 32)
+
+    poses, report = decode_pose_v2(
+        output,
+        center_threshold=0.5,
+        keypoint_threshold=0.2,
+        association_radius=12.0,
+        duplicate_center_radius=7.0,
+        duplicate_joint_distance=0.05,
+    )
+
+    assert len(poses) == 2
+    assert report.person_count == 2
+    assert report.suppressed_duplicate_people == 0
+
+
+def test_v2_distal_radius_recovers_wrist_with_noisy_center_vote():
+    output = _empty_output()
+    cx, cy = 32, 32
+    output["center"][0, 0, cy, cx] = 8.0
+
+    _put_keypoint(output, BodyKeypoint.NOSE, 32, 18, cx, cy)
+    _put_keypoint(output, BodyKeypoint.LEFT_SHOULDER, 24, 27, cx, cy)
+    _put_keypoint(
+        output,
+        BodyKeypoint.LEFT_ELBOW,
+        19,
+        34,
+        cx,
+        cy,
+        parent_x=24,
+        parent_y=27,
+    )
+    _put_keypoint(
+        output,
+        BodyKeypoint.LEFT_WRIST,
+        13,
+        42,
+        cx,
+        cy,
+        parent_x=19,
+        parent_y=34,
+    )
+
+    wrist_index = int(BodyKeypoint.LEFT_WRIST)
+    # A rede errou o voto para o centro em 9 pixels: tronco rejeitaria, mas a
+    # tolerância específica de extremidade deve manter o punho.
+    output["center_offsets"][0, 2 * wrist_index, 42, 13] = (cx + 9) - 13
+    output["center_offsets"][0, 2 * wrist_index + 1, 42, 13] = cy - 42
+
+    strict_poses, _ = decode_pose_v2(
+        output,
+        center_threshold=0.5,
+        keypoint_threshold=0.2,
+        association_radius=7.0,
+        extremity_association_factor=1.0,
+    )
+    relaxed_poses, _ = decode_pose_v2(
+        output,
+        center_threshold=0.5,
+        keypoint_threshold=0.2,
+        association_radius=7.0,
+        extremity_association_factor=1.65,
+    )
+
+    assert strict_poses[0][wrist_index].confidence == 0.0
+    assert relaxed_poses[0][wrist_index].confidence > 0.0
