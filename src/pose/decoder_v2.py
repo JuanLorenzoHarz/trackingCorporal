@@ -5,10 +5,10 @@ A associação ocorre em duas etapas:
 2. quando existe pai anatômico, parent_offsets mede se o candidato realmente se
    conecta ao ombro/cotovelo/quadril/joelho correto.
 
-A proteção anti-X não assume mais que pares L/R próximos são necessariamente
-errados. Em perfil, ombros, braços e pernas podem se sobrepor naturalmente na
-projeção 2D. Um ponto só é removido quando, além da proximidade, a geometria da
-cadeia indica que a associação cruzada é claramente mais coerente que a direta.
+A proteção anti-X é compatível com poses de perfil. Além disso, centros múltiplos
+que produzam praticamente a mesma pose são fundidos antes do tracking temporal,
+evantando o melhor keypoint de cada hipótese em vez de criar dois IDs para a
+mesma pessoa.
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ import torch
 from torch.nn import functional as F
 
 from src.core.types import Keypoint, Pose
-from src.pose.keypoints import NUM_KEYPOINTS
+from src.pose.keypoints import BodyKeypoint, NUM_KEYPOINTS
 from src.pose.structure_v2 import (
     BILATERAL_PAIRS,
     DECODE_ORDER,
@@ -29,11 +29,22 @@ from src.pose.structure_v2 import (
 )
 
 
+LIMB_INDICES = frozenset(
+    (
+        int(BodyKeypoint.LEFT_ELBOW),
+        int(BodyKeypoint.RIGHT_ELBOW),
+        int(BodyKeypoint.LEFT_KNEE),
+        int(BodyKeypoint.RIGHT_KNEE),
+    )
+)
+
+
 @dataclass(frozen=True, slots=True)
 class MultiPersonDecodeReport:
     person_count: int
     assigned_candidates: int
     rejected_bilateral_points: int
+    suppressed_duplicate_people: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,6 +66,13 @@ class _Candidate:
     parent_vote_y: float | None
 
 
+@dataclass(frozen=True, slots=True)
+class _DecodedPerson:
+    center: _Center
+    pose: Pose
+    quality: float
+
+
 def decode_pose_v2(
     output: dict[str, torch.Tensor],
     center_threshold: float = 0.30,
@@ -62,11 +80,16 @@ def decode_pose_v2(
     max_people: int = 6,
     candidates_per_keypoint: int = 12,
     association_radius: float = 7.0,
+    limb_association_factor: float = 1.30,
+    extremity_association_factor: float = 1.65,
     parent_sigma: float = 4.0,
-    extremity_parent_sigma: float = 2.5,
+    extremity_parent_sigma: float = 4.0,
     bilateral_min_separation: float = 1.5,
+    duplicate_center_radius: float = 6.0,
+    duplicate_joint_distance: float = 0.05,
+    duplicate_overlap_ratio: float = 0.60,
 ) -> tuple[list[Pose], MultiPersonDecodeReport]:
-    """Converte heads V2 em uma lista de poses, uma por centro detectado."""
+    """Converte heads V2 em poses independentes e funde duplicatas evidentes."""
     center_logits = _single_batch(output["center"])
     keypoint_logits = _single_batch(output["keypoints"])
     center_offsets = _single_batch(output["center_offsets"])
@@ -80,6 +103,10 @@ def decode_pose_v2(
         raise ValueError("center_offsets deve possuir 34 canais.")
     if parent_offsets.shape[0] != NUM_KEYPOINTS * 2:
         raise ValueError("parent_offsets deve possuir 34 canais.")
+    if association_radius <= 0.0:
+        raise ValueError("association_radius deve ser positivo.")
+    if limb_association_factor < 1.0 or extremity_association_factor < 1.0:
+        raise ValueError("Fatores de associação de membros devem ser >= 1.")
 
     _, height, width = keypoint_logits.shape
     centers = _extract_centers(
@@ -88,7 +115,7 @@ def decode_pose_v2(
         max_people=max_people,
     )
     if not centers:
-        return [], MultiPersonDecodeReport(0, 0, 0)
+        return [], MultiPersonDecodeReport(0, 0, 0, 0)
 
     candidates_by_person: list[list[list[_Candidate]]] = [
         [[] for _ in range(NUM_KEYPOINTS)] for _ in centers
@@ -104,6 +131,12 @@ def decode_pose_v2(
             threshold=keypoint_threshold,
             top_k=max(candidates_per_keypoint, max_people * 2),
         )
+        allowed_radius = _association_radius_for_keypoint(
+            keypoint_index,
+            base_radius=association_radius,
+            limb_factor=limb_association_factor,
+            extremity_factor=extremity_association_factor,
+        )
 
         for candidate in candidates:
             person_index, distance = _nearest_center(
@@ -111,12 +144,12 @@ def decode_pose_v2(
                 candidate.center_vote_y,
                 centers,
             )
-            if person_index is None or distance > association_radius:
+            if person_index is None or distance > allowed_radius:
                 continue
             candidates_by_person[person_index][keypoint_index].append(candidate)
             assigned_candidates += 1
 
-    poses: list[Pose] = []
+    decoded_people: list[_DecodedPerson] = []
     rejected_bilateral_points = 0
 
     for person_index, center in enumerate(centers):
@@ -126,6 +159,12 @@ def decode_pose_v2(
             parent_index = PARENT_BY_KEYPOINT[keypoint_index]
             parent = selected[parent_index] if parent_index >= 0 else None
             best: tuple[_Candidate, float] | None = None
+            allowed_radius = _association_radius_for_keypoint(
+                keypoint_index,
+                base_radius=association_radius,
+                limb_factor=limb_association_factor,
+                extremity_factor=extremity_association_factor,
+            )
 
             for candidate in candidates_by_person[person_index][keypoint_index]:
                 center_error = hypot(
@@ -133,7 +172,7 @@ def decode_pose_v2(
                     candidate.center_vote_y - center.y,
                 )
                 center_factor = exp(
-                    -0.5 * (center_error / max(association_radius * 0.55, 1e-6)) ** 2
+                    -0.5 * (center_error / max(allowed_radius * 0.60, 1e-6)) ** 2
                 )
                 adjusted = candidate.score * center_factor
 
@@ -148,7 +187,9 @@ def decode_pose_v2(
                         if keypoint_index in EXTREMITY_INDICES
                         else parent_sigma
                     )
-                    parent_factor = exp(-0.5 * (parent_error / max(sigma, 1e-6)) ** 2)
+                    parent_factor = exp(
+                        -0.5 * (parent_error / max(sigma, 1e-6)) ** 2
+                    )
                     adjusted *= parent_factor
 
                 if best is None or adjusted > best[1]:
@@ -156,11 +197,8 @@ def decode_pose_v2(
 
             selected[keypoint_index] = best
 
-        # Perfil-safe: proximidade L/R por si só NÃO é erro. Ombros, quadris,
-        # joelhos etc. podem se sobrepor quando a pessoa gira de lado. Só
-        # rejeitamos um lado se a cadeia parecer realmente cruzada em relação
-        # aos pais semânticos (ex.: punho esquerdo geometricamente ligado ao
-        # cotovelo direito e vice-versa).
+        # Perfil-safe: proximidade L/R por si só não é erro. Só removemos um
+        # lado quando a cadeia cruzada é claramente mais coerente que a direta.
         for left_index, right_index in BILATERAL_PAIRS:
             left = selected[left_index]
             right = selected[right_index]
@@ -184,31 +222,176 @@ def decode_pose_v2(
             rejected_bilateral_points += 1
 
         points: list[Keypoint] = []
+        selected_scores: list[float] = []
         for keypoint_index in range(NUM_KEYPOINTS):
             item = selected[keypoint_index]
             if item is None:
                 points.append(Keypoint(0.0, 0.0, 0.0))
                 continue
             candidate, adjusted_score = item
+            confidence = max(0.0, min(1.0, adjusted_score))
             points.append(
                 Keypoint(
                     x=candidate.x / max(width - 1, 1),
                     y=candidate.y / max(height - 1, 1),
-                    confidence=max(0.0, min(1.0, adjusted_score)),
+                    confidence=confidence,
                 )
             )
+            if confidence >= keypoint_threshold:
+                selected_scores.append(confidence)
 
-        # Um centro sozinho não basta: exigimos pelo menos alguns pontos
-        # associados para materializar uma pessoa na saída.
-        valid_count = sum(point.confidence >= keypoint_threshold for point in points)
+        valid_count = len(selected_scores)
         if valid_count >= 3:
-            poses.append(Pose(points))
+            mean_confidence = sum(selected_scores) / valid_count
+            quality = center.score + mean_confidence + 0.04 * valid_count
+            decoded_people.append(
+                _DecodedPerson(center=center, pose=Pose(points), quality=quality)
+            )
+
+    deduplicated, suppressed_duplicates = _deduplicate_people(
+        decoded_people,
+        keypoint_threshold=keypoint_threshold,
+        center_radius=duplicate_center_radius,
+        joint_distance=duplicate_joint_distance,
+        overlap_ratio=duplicate_overlap_ratio,
+    )
+    poses = [person.pose for person in deduplicated]
 
     return poses, MultiPersonDecodeReport(
         person_count=len(poses),
         assigned_candidates=assigned_candidates,
         rejected_bilateral_points=rejected_bilateral_points,
+        suppressed_duplicate_people=suppressed_duplicates,
     )
+
+
+def _association_radius_for_keypoint(
+    keypoint_index: int,
+    base_radius: float,
+    limb_factor: float,
+    extremity_factor: float,
+) -> float:
+    if keypoint_index in EXTREMITY_INDICES:
+        return base_radius * extremity_factor
+    if keypoint_index in LIMB_INDICES:
+        return base_radius * limb_factor
+    return base_radius
+
+
+def _deduplicate_people(
+    people: list[_DecodedPerson],
+    *,
+    keypoint_threshold: float,
+    center_radius: float,
+    joint_distance: float,
+    overlap_ratio: float,
+) -> tuple[list[_DecodedPerson], int]:
+    """Funde hipóteses que representam semanticamente a mesma pessoa.
+
+    Distância de centro sozinha nunca é suficiente: duas pessoas reais podem
+    estar próximas. Também exigimos que vários keypoints de mesmo significado
+    ocupem praticamente a mesma posição.
+    """
+    if not people:
+        return [], 0
+
+    kept: list[_DecodedPerson] = []
+    suppressed = 0
+
+    for person in sorted(people, key=lambda item: item.quality, reverse=True):
+        duplicate_index: int | None = None
+        for index, existing in enumerate(kept):
+            center_distance = hypot(
+                person.center.x - existing.center.x,
+                person.center.y - existing.center.y,
+            )
+            if center_distance > center_radius:
+                continue
+            if _poses_semantically_overlap(
+                person.pose,
+                existing.pose,
+                keypoint_threshold=keypoint_threshold,
+                joint_distance=joint_distance,
+                overlap_ratio=overlap_ratio,
+            ):
+                duplicate_index = index
+                break
+
+        if duplicate_index is None:
+            kept.append(person)
+            continue
+
+        kept[duplicate_index] = _merge_decoded_people(
+            kept[duplicate_index],
+            person,
+            keypoint_threshold=keypoint_threshold,
+        )
+        suppressed += 1
+
+    return kept, suppressed
+
+
+def _poses_semantically_overlap(
+    first: Pose,
+    second: Pose,
+    *,
+    keypoint_threshold: float,
+    joint_distance: float,
+    overlap_ratio: float,
+) -> bool:
+    comparable = 0
+    close = 0
+    first_valid = 0
+    second_valid = 0
+
+    for first_point, second_point in zip(first.keypoints, second.keypoints):
+        first_ok = first_point.is_valid(keypoint_threshold)
+        second_ok = second_point.is_valid(keypoint_threshold)
+        first_valid += int(first_ok)
+        second_valid += int(second_ok)
+        if not (first_ok and second_ok):
+            continue
+        comparable += 1
+        distance = hypot(
+            first_point.x - second_point.x,
+            first_point.y - second_point.y,
+        )
+        if distance <= joint_distance:
+            close += 1
+
+    if comparable < 3 or close < 3:
+        return False
+
+    comparable_ratio = close / comparable
+    smaller_pose_coverage = close / max(1, min(first_valid, second_valid))
+    return (
+        comparable_ratio >= overlap_ratio
+        and smaller_pose_coverage >= 0.45
+    )
+
+
+def _merge_decoded_people(
+    first: _DecodedPerson,
+    second: _DecodedPerson,
+    *,
+    keypoint_threshold: float,
+) -> _DecodedPerson:
+    points: list[Keypoint] = []
+    for first_point, second_point in zip(first.pose.keypoints, second.pose.keypoints):
+        if second_point.confidence > first_point.confidence:
+            points.append(second_point)
+        else:
+            points.append(first_point)
+
+    valid = [
+        point.confidence
+        for point in points
+        if point.is_valid(keypoint_threshold)
+    ]
+    mean_confidence = sum(valid) / len(valid) if valid else 0.0
+    better_center = first.center if first.center.score >= second.center.score else second.center
+    quality = better_center.score + mean_confidence + 0.04 * len(valid)
+    return _DecodedPerson(center=better_center, pose=Pose(points), quality=quality)
 
 
 def _pair_geometry_is_crossed(
@@ -216,13 +399,7 @@ def _pair_geometry_is_crossed(
     left_index: int,
     right_index: int,
 ) -> bool:
-    """Distingue um X real de sobreposição L/R causada por pose de perfil.
-
-    Para pares sem pai (ombros/quadris) a proximidade é sempre permitida. Para
-    cotovelos, punhos, joelhos e tornozelos comparamos o custo geométrico da
-    cadeia direta contra a cadeia trocada. Em perfil os custos tendem a ficar
-    próximos; em um X verdadeiro a ligação cruzada fica claramente menor.
-    """
+    """Distingue um X real de sobreposição L/R causada por pose de perfil."""
     left_parent_index = PARENT_BY_KEYPOINT[left_index]
     right_parent_index = PARENT_BY_KEYPOINT[right_index]
     if left_parent_index < 0 or right_parent_index < 0:
