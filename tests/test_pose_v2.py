@@ -1,0 +1,363 @@
+"""Testes da arquitetura e decoder multi-pessoa da PoseNet V2."""
+
+import torch
+
+from src.pose.decoder_v2 import decode_pose_v2
+from src.pose.keypoints import BodyKeypoint, NUM_KEYPOINTS
+from src.pose.model import PoseNet
+from src.pose.model_v2 import PoseNetV2
+
+
+def _empty_output(size: int = 64) -> dict[str, torch.Tensor]:
+    return {
+        "center": torch.full((1, 1, size, size), -10.0),
+        "keypoints": torch.full((1, NUM_KEYPOINTS, size, size), -10.0),
+        "center_offsets": torch.zeros((1, NUM_KEYPOINTS * 2, size, size)),
+        "parent_offsets": torch.zeros((1, NUM_KEYPOINTS * 2, size, size)),
+    }
+
+
+def _put_keypoint(
+    output: dict[str, torch.Tensor],
+    keypoint: BodyKeypoint,
+    x: int,
+    y: int,
+    center_x: int,
+    center_y: int,
+    logit: float = 8.0,
+    parent_x: int | None = None,
+    parent_y: int | None = None,
+) -> None:
+    index = int(keypoint)
+    output["keypoints"][0, index, y, x] = logit
+    output["center_offsets"][0, 2 * index, y, x] = center_x - x
+    output["center_offsets"][0, 2 * index + 1, y, x] = center_y - y
+    if parent_x is not None and parent_y is not None:
+        output["parent_offsets"][0, 2 * index, y, x] = parent_x - x
+        output["parent_offsets"][0, 2 * index + 1, y, x] = parent_y - y
+
+
+def test_pose_v2_output_shapes():
+    model = PoseNetV2().eval()
+    image = torch.zeros((1, 3, 256, 256), dtype=torch.float32)
+    with torch.inference_mode():
+        output = model(image)
+
+    assert output["center"].shape == (1, 1, 64, 64)
+    assert output["keypoints"].shape == (1, NUM_KEYPOINTS, 64, 64)
+    assert output["center_offsets"].shape == (1, NUM_KEYPOINTS * 2, 64, 64)
+    assert output["parent_offsets"].shape == (1, NUM_KEYPOINTS * 2, 64, 64)
+
+
+def test_pose_v2_reuses_compatible_v1_backbone(tmp_path):
+    v1 = PoseNet()
+    with torch.no_grad():
+        v1.encoder1[0].weight.fill_(0.123)
+    checkpoint = tmp_path / "v1.pt"
+    torch.save({"model_state": v1.state_dict()}, checkpoint)
+
+    v2 = PoseNetV2()
+    copied = v2.initialize_from_v1(checkpoint)
+
+    assert copied > 0
+    assert torch.allclose(
+        v2.encoder1[0].weight,
+        torch.full_like(v2.encoder1[0].weight, 0.123),
+    )
+
+
+def test_v2_decoder_returns_no_person_without_center():
+    poses, report = decode_pose_v2(_empty_output())
+    assert poses == []
+    assert report.person_count == 0
+
+
+def test_v2_decoder_separates_two_people_by_center_votes():
+    output = _empty_output()
+    centers = ((18, 32), (46, 32))
+    for cx, cy in centers:
+        output["center"][0, 0, cy, cx] = 8.0
+        _put_keypoint(output, BodyKeypoint.NOSE, cx, 20, cx, cy)
+        _put_keypoint(output, BodyKeypoint.LEFT_SHOULDER, cx - 4, 28, cx, cy)
+        _put_keypoint(output, BodyKeypoint.RIGHT_SHOULDER, cx + 4, 28, cx, cy)
+
+    poses, report = decode_pose_v2(
+        output,
+        center_threshold=0.5,
+        keypoint_threshold=0.2,
+        association_radius=3.0,
+    )
+
+    assert report.person_count == 2
+    assert len(poses) == 2
+    centers_x = sorted(
+        (pose[int(BodyKeypoint.LEFT_SHOULDER)].x + pose[int(BodyKeypoint.RIGHT_SHOULDER)].x) / 2
+        for pose in poses
+    )
+    assert centers_x[0] < 0.5 < centers_x[1]
+
+
+def test_v2_parent_offsets_prevent_crossed_wrist_x():
+    output = _empty_output()
+    cx, cy = 32, 32
+    output["center"][0, 0, cy, cx] = 8.0
+
+    _put_keypoint(output, BodyKeypoint.NOSE, 32, 18, cx, cy)
+    _put_keypoint(output, BodyKeypoint.LEFT_SHOULDER, 23, 26, cx, cy)
+    _put_keypoint(output, BodyKeypoint.RIGHT_SHOULDER, 41, 26, cx, cy)
+
+    _put_keypoint(
+        output, BodyKeypoint.LEFT_ELBOW, 19, 34, cx, cy,
+        parent_x=23, parent_y=26,
+    )
+    _put_keypoint(
+        output, BodyKeypoint.RIGHT_ELBOW, 45, 34, cx, cy,
+        parent_x=41, parent_y=26,
+    )
+
+    _put_keypoint(
+        output, BodyKeypoint.LEFT_WRIST, 48, 42, cx, cy,
+        logit=9.0, parent_x=45, parent_y=34,
+    )
+    _put_keypoint(
+        output, BodyKeypoint.LEFT_WRIST, 16, 42, cx, cy,
+        logit=7.0, parent_x=19, parent_y=34,
+    )
+    _put_keypoint(
+        output, BodyKeypoint.RIGHT_WRIST, 48, 42, cx, cy,
+        logit=8.0, parent_x=45, parent_y=34,
+    )
+
+    poses, report = decode_pose_v2(
+        output,
+        center_threshold=0.5,
+        keypoint_threshold=0.2,
+        association_radius=3.0,
+        extremity_parent_sigma=2.0,
+    )
+
+    assert report.person_count == 1
+    pose = poses[0]
+    left_wrist = pose[int(BodyKeypoint.LEFT_WRIST)]
+    left_elbow = pose[int(BodyKeypoint.LEFT_ELBOW)]
+    right_wrist = pose[int(BodyKeypoint.RIGHT_WRIST)]
+
+    assert left_wrist.confidence > 0.0
+    assert left_wrist.x < 0.5
+    assert left_wrist.x < left_elbow.x + 0.05
+    assert right_wrist.x > 0.5
+
+
+def test_v2_profile_keeps_close_left_right_pairs():
+    """Perfil real pode projetar L/R quase no mesmo X sem ser um erro."""
+    output = _empty_output()
+    cx, cy = 32, 32
+    output["center"][0, 0, cy, cx] = 8.0
+
+    _put_keypoint(output, BodyKeypoint.NOSE, 32, 18, cx, cy)
+    _put_keypoint(output, BodyKeypoint.LEFT_SHOULDER, 31, 27, cx, cy)
+    _put_keypoint(output, BodyKeypoint.RIGHT_SHOULDER, 32, 27, cx, cy)
+    _put_keypoint(
+        output,
+        BodyKeypoint.LEFT_ELBOW,
+        31,
+        36,
+        cx,
+        cy,
+        parent_x=31,
+        parent_y=27,
+    )
+    _put_keypoint(
+        output,
+        BodyKeypoint.RIGHT_ELBOW,
+        32,
+        36,
+        cx,
+        cy,
+        parent_x=32,
+        parent_y=27,
+    )
+
+    poses, report = decode_pose_v2(
+        output,
+        center_threshold=0.5,
+        keypoint_threshold=0.2,
+        association_radius=3.0,
+        bilateral_min_separation=2.0,
+    )
+
+    assert report.person_count == 1
+    assert report.rejected_bilateral_points == 0
+    pose = poses[0]
+    assert pose[int(BodyKeypoint.LEFT_SHOULDER)].confidence > 0.0
+    assert pose[int(BodyKeypoint.RIGHT_SHOULDER)].confidence > 0.0
+    assert pose[int(BodyKeypoint.LEFT_ELBOW)].confidence > 0.0
+    assert pose[int(BodyKeypoint.RIGHT_ELBOW)].confidence > 0.0
+
+
+def test_v2_fuses_two_centers_that_decode_the_same_person():
+    output = _empty_output()
+    center_a = (30, 32)
+    center_b = (34, 32)
+    output["center"][0, 0, center_a[1], center_a[0]] = 9.0
+    output["center"][0, 0, center_b[1], center_b[0]] = 8.5
+
+    for cx, shift in ((center_a[0], 0), (center_b[0], 2)):
+        _put_keypoint(output, BodyKeypoint.NOSE, 30 + shift, 18, cx, 32)
+        _put_keypoint(output, BodyKeypoint.LEFT_SHOULDER, 26 + shift, 27, cx, 32)
+        _put_keypoint(output, BodyKeypoint.RIGHT_SHOULDER, 34 + shift, 27, cx, 32)
+        _put_keypoint(output, BodyKeypoint.LEFT_HIP, 27 + shift, 39, cx, 32)
+        _put_keypoint(output, BodyKeypoint.RIGHT_HIP, 33 + shift, 39, cx, 32)
+
+    poses, report = decode_pose_v2(
+        output,
+        center_threshold=0.5,
+        keypoint_threshold=0.2,
+        association_radius=4.0,
+        duplicate_center_radius=6.0,
+        duplicate_joint_distance=0.05,
+    )
+
+    assert len(poses) == 1
+    assert report.person_count == 1
+    assert report.suppressed_duplicate_people == 1
+
+
+def test_v2_keeps_two_nearby_people_when_semantic_joints_do_not_overlap():
+    output = _empty_output()
+    center_a = (29, 32)
+    center_b = (35, 32)
+    output["center"][0, 0, center_a[1], center_a[0]] = 9.0
+    output["center"][0, 0, center_b[1], center_b[0]] = 8.8
+
+    # Centros são próximos, mas os esqueletos ocupam regiões diferentes.
+    for cx, base_x in ((center_a[0], 20), (center_b[0], 40)):
+        _put_keypoint(output, BodyKeypoint.NOSE, base_x, 18, cx, 32)
+        _put_keypoint(output, BodyKeypoint.LEFT_SHOULDER, base_x - 3, 27, cx, 32)
+        _put_keypoint(output, BodyKeypoint.RIGHT_SHOULDER, base_x + 3, 27, cx, 32)
+        _put_keypoint(output, BodyKeypoint.LEFT_HIP, base_x - 2, 39, cx, 32)
+        _put_keypoint(output, BodyKeypoint.RIGHT_HIP, base_x + 2, 39, cx, 32)
+
+    poses, report = decode_pose_v2(
+        output,
+        center_threshold=0.5,
+        keypoint_threshold=0.2,
+        association_radius=12.0,
+        duplicate_center_radius=7.0,
+        duplicate_joint_distance=0.05,
+    )
+
+    assert len(poses) == 2
+    assert report.person_count == 2
+    assert report.suppressed_duplicate_people == 0
+
+
+def test_v2_distal_radius_recovers_wrist_with_noisy_center_vote():
+    output = _empty_output()
+    cx, cy = 32, 32
+    output["center"][0, 0, cy, cx] = 8.0
+
+    _put_keypoint(output, BodyKeypoint.NOSE, 32, 18, cx, cy)
+    _put_keypoint(output, BodyKeypoint.LEFT_SHOULDER, 24, 27, cx, cy)
+    _put_keypoint(
+        output,
+        BodyKeypoint.LEFT_ELBOW,
+        19,
+        34,
+        cx,
+        cy,
+        parent_x=24,
+        parent_y=27,
+    )
+    _put_keypoint(
+        output,
+        BodyKeypoint.LEFT_WRIST,
+        13,
+        42,
+        cx,
+        cy,
+        parent_x=19,
+        parent_y=34,
+    )
+
+    wrist_index = int(BodyKeypoint.LEFT_WRIST)
+    # A rede errou o voto para o centro em 9 pixels: tronco rejeitaria, mas a
+    # tolerância específica de extremidade deve manter o punho.
+    output["center_offsets"][0, 2 * wrist_index, 42, 13] = (cx + 9) - 13
+    output["center_offsets"][0, 2 * wrist_index + 1, 42, 13] = cy - 42
+
+    strict_poses, _ = decode_pose_v2(
+        output,
+        center_threshold=0.5,
+        keypoint_threshold=0.2,
+        association_radius=7.0,
+        extremity_association_factor=1.0,
+    )
+    relaxed_poses, _ = decode_pose_v2(
+        output,
+        center_threshold=0.5,
+        keypoint_threshold=0.2,
+        association_radius=7.0,
+        extremity_association_factor=1.65,
+    )
+
+    assert strict_poses[0][wrist_index].confidence == 0.0
+    assert relaxed_poses[0][wrist_index].confidence > 0.0
+
+
+def test_v2_aligns_crossed_torso_without_breaking_leg_chain():
+    """Ombros e quadris invertidos não podem desenhar um X no tronco."""
+    output = _empty_output()
+    cx, cy = 32, 32
+    output["center"][0, 0, cy, cx] = 8.0
+
+    _put_keypoint(output, BodyKeypoint.NOSE, 32, 16, cx, cy)
+    _put_keypoint(output, BodyKeypoint.LEFT_SHOULDER, 24, 24, cx, cy)
+    _put_keypoint(output, BodyKeypoint.RIGHT_SHOULDER, 40, 24, cx, cy)
+
+    # Quadris chegam semanticamente invertidos em relação aos ombros.
+    _put_keypoint(output, BodyKeypoint.LEFT_HIP, 40, 38, cx, cy)
+    _put_keypoint(output, BodyKeypoint.RIGHT_HIP, 24, 38, cx, cy)
+
+    # As pernas continuam coerentes com os quadris invertidos originais.
+    _put_keypoint(
+        output, BodyKeypoint.LEFT_KNEE, 41, 48, cx, cy,
+        parent_x=40, parent_y=38,
+    )
+    _put_keypoint(
+        output, BodyKeypoint.RIGHT_KNEE, 23, 48, cx, cy,
+        parent_x=24, parent_y=38,
+    )
+    _put_keypoint(
+        output, BodyKeypoint.LEFT_ANKLE, 42, 58, cx, cy,
+        parent_x=41, parent_y=48,
+    )
+    _put_keypoint(
+        output, BodyKeypoint.RIGHT_ANKLE, 22, 58, cx, cy,
+        parent_x=23, parent_y=48,
+    )
+
+    poses, report = decode_pose_v2(
+        output,
+        center_threshold=0.5,
+        keypoint_threshold=0.2,
+        association_radius=4.0,
+    )
+
+    assert report.person_count == 1
+    assert report.corrected_torso_swaps == 1
+
+    pose = poses[0]
+    left_shoulder = pose[int(BodyKeypoint.LEFT_SHOULDER)]
+    right_shoulder = pose[int(BodyKeypoint.RIGHT_SHOULDER)]
+    left_hip = pose[int(BodyKeypoint.LEFT_HIP)]
+    right_hip = pose[int(BodyKeypoint.RIGHT_HIP)]
+    left_knee = pose[int(BodyKeypoint.LEFT_KNEE)]
+    right_knee = pose[int(BodyKeypoint.RIGHT_KNEE)]
+
+    # Depois da correção, cada metade do tronco permanece do mesmo lado.
+    assert abs(left_shoulder.x - left_hip.x) < abs(left_shoulder.x - right_hip.x)
+    assert abs(right_shoulder.x - right_hip.x) < abs(right_shoulder.x - left_hip.x)
+
+    # A cadeia inferior inteira foi trocada junto, não apenas os quadris.
+    assert left_knee.x < right_knee.x
