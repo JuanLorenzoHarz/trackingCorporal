@@ -38,6 +38,12 @@ LIMB_INDICES = frozenset(
     )
 )
 
+LOWER_BODY_SWAP_PAIRS = (
+    (int(BodyKeypoint.LEFT_HIP), int(BodyKeypoint.RIGHT_HIP)),
+    (int(BodyKeypoint.LEFT_KNEE), int(BodyKeypoint.RIGHT_KNEE)),
+    (int(BodyKeypoint.LEFT_ANKLE), int(BodyKeypoint.RIGHT_ANKLE)),
+)
+
 
 @dataclass(frozen=True, slots=True)
 class MultiPersonDecodeReport:
@@ -45,6 +51,7 @@ class MultiPersonDecodeReport:
     assigned_candidates: int
     rejected_bilateral_points: int
     suppressed_duplicate_people: int = 0
+    corrected_torso_swaps: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -151,6 +158,7 @@ def decode_pose_v2(
 
     decoded_people: list[_DecodedPerson] = []
     rejected_bilateral_points = 0
+    corrected_torso_swaps = 0
 
     for person_index, center in enumerate(centers):
         selected: list[tuple[_Candidate, float] | None] = [None] * NUM_KEYPOINTS
@@ -196,6 +204,13 @@ def decode_pose_v2(
                     best = (candidate, adjusted)
 
             selected[keypoint_index] = best
+
+        # Ombros e quadris não possuem pai em PARENT_BY_KEYPOINT. Validamos
+        # explicitamente a coerência entre as duas metades do tronco. Se a
+        # atribuição cruzada for claramente melhor, trocamos toda a cadeia
+        # inferior para manter quadril->joelho->tornozelo consistente.
+        if _align_lower_body_to_shoulders(selected):
+            corrected_torso_swaps += 1
 
         # Perfil-safe: proximidade L/R por si só não é erro. Só removemos um
         # lado quando a cadeia cruzada é claramente mais coerente que a direta.
@@ -262,7 +277,57 @@ def decode_pose_v2(
         assigned_candidates=assigned_candidates,
         rejected_bilateral_points=rejected_bilateral_points,
         suppressed_duplicate_people=suppressed_duplicates,
+        corrected_torso_swaps=corrected_torso_swaps,
     )
+
+
+def _align_lower_body_to_shoulders(
+    selected: list[tuple[_Candidate, float] | None],
+    *,
+    swap_ratio: float = 0.80,
+    margin: float = 0.75,
+) -> bool:
+    """Corrige X estrutural entre ombros e quadris sem usar lado da tela.
+
+    Em perfil, os custos direto e cruzado ficam parecidos; por isso nenhuma
+    troca ocorre só por proximidade. A correção exige vantagem clara da
+    associação cruzada e troca a cadeia inferior inteira.
+    """
+    left_shoulder = selected[int(BodyKeypoint.LEFT_SHOULDER)]
+    right_shoulder = selected[int(BodyKeypoint.RIGHT_SHOULDER)]
+    left_hip = selected[int(BodyKeypoint.LEFT_HIP)]
+    right_hip = selected[int(BodyKeypoint.RIGHT_HIP)]
+
+    if any(
+        item is None
+        for item in (left_shoulder, right_shoulder, left_hip, right_hip)
+    ):
+        return False
+
+    ls = left_shoulder[0]
+    rs = right_shoulder[0]
+    lh = left_hip[0]
+    rh = right_hip[0]
+
+    direct_cost = hypot(ls.x - lh.x, ls.y - lh.y) + hypot(
+        rs.x - rh.x, rs.y - rh.y
+    )
+    crossed_cost = hypot(ls.x - rh.x, ls.y - rh.y) + hypot(
+        rs.x - lh.x, rs.y - lh.y
+    )
+
+    if not (
+        crossed_cost + margin < direct_cost
+        and crossed_cost < direct_cost * swap_ratio
+    ):
+        return False
+
+    for left_index, right_index in LOWER_BODY_SWAP_PAIRS:
+        selected[left_index], selected[right_index] = (
+            selected[right_index],
+            selected[left_index],
+        )
+    return True
 
 
 def _association_radius_for_keypoint(
