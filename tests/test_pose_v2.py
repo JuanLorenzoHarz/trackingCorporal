@@ -303,3 +303,61 @@ def test_v2_distal_radius_recovers_wrist_with_noisy_center_vote():
 
     assert strict_poses[0][wrist_index].confidence == 0.0
     assert relaxed_poses[0][wrist_index].confidence > 0.0
+
+
+def test_v2_aligns_crossed_torso_without_breaking_leg_chain():
+    """Ombros e quadris invertidos não podem desenhar um X no tronco."""
+    output = _empty_output()
+    cx, cy = 32, 32
+    output["center"][0, 0, cy, cx] = 8.0
+
+    _put_keypoint(output, BodyKeypoint.NOSE, 32, 16, cx, cy)
+    _put_keypoint(output, BodyKeypoint.LEFT_SHOULDER, 24, 24, cx, cy)
+    _put_keypoint(output, BodyKeypoint.RIGHT_SHOULDER, 40, 24, cx, cy)
+
+    # Quadris chegam semanticamente invertidos em relação aos ombros.
+    _put_keypoint(output, BodyKeypoint.LEFT_HIP, 40, 38, cx, cy)
+    _put_keypoint(output, BodyKeypoint.RIGHT_HIP, 24, 38, cx, cy)
+
+    # As pernas continuam coerentes com os quadris invertidos originais.
+    _put_keypoint(
+        output, BodyKeypoint.LEFT_KNEE, 41, 48, cx, cy,
+        parent_x=40, parent_y=38,
+    )
+    _put_keypoint(
+        output, BodyKeypoint.RIGHT_KNEE, 23, 48, cx, cy,
+        parent_x=24, parent_y=38,
+    )
+    _put_keypoint(
+        output, BodyKeypoint.LEFT_ANKLE, 42, 58, cx, cy,
+        parent_x=41, parent_y=48,
+    )
+    _put_keypoint(
+        output, BodyKeypoint.RIGHT_ANKLE, 22, 58, cx, cy,
+        parent_x=23, parent_y=48,
+    )
+
+    poses, report = decode_pose_v2(
+        output,
+        center_threshold=0.5,
+        keypoint_threshold=0.2,
+        association_radius=4.0,
+    )
+
+    assert report.person_count == 1
+    assert report.corrected_torso_swaps == 1
+
+    pose = poses[0]
+    left_shoulder = pose[int(BodyKeypoint.LEFT_SHOULDER)]
+    right_shoulder = pose[int(BodyKeypoint.RIGHT_SHOULDER)]
+    left_hip = pose[int(BodyKeypoint.LEFT_HIP)]
+    right_hip = pose[int(BodyKeypoint.RIGHT_HIP)]
+    left_knee = pose[int(BodyKeypoint.LEFT_KNEE)]
+    right_knee = pose[int(BodyKeypoint.RIGHT_KNEE)]
+
+    # Depois da correção, cada metade do tronco permanece do mesmo lado.
+    assert abs(left_shoulder.x - left_hip.x) < abs(left_shoulder.x - right_hip.x)
+    assert abs(right_shoulder.x - right_hip.x) < abs(right_shoulder.x - left_hip.x)
+
+    # A cadeia inferior inteira foi trocada junto, não apenas os quadris.
+    assert left_knee.x < right_knee.x
