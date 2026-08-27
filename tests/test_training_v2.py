@@ -49,12 +49,15 @@ def test_extremity_weights_prioritize_wrists_and_ankles():
     shoulder = int(BodyKeypoint.LEFT_SHOULDER)
     elbow = int(BodyKeypoint.LEFT_ELBOW)
     wrist = int(BodyKeypoint.LEFT_WRIST)
+    knee = int(BodyKeypoint.LEFT_KNEE)
     ankle = int(BodyKeypoint.LEFT_ANKLE)
 
     assert weights[hip] == 1.0
     assert weights[shoulder] > weights[hip]
     assert weights[elbow] > weights[shoulder]
     assert weights[wrist] > weights[elbow]
+    assert weights[knee] > weights[hip]
+    assert weights[ankle] > weights[knee]
     assert weights[ankle] > weights[wrist]
 
 
