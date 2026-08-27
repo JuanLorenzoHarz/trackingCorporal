@@ -66,6 +66,7 @@ def draw_status(
     assigned_candidates: int,
     rejected_bilateral: int,
     suppressed_duplicates: int,
+    corrected_torso_swaps: int,
 ) -> None:
     lines = (
         "POSENET V2 - MULTI-PESSOA",
@@ -73,6 +74,7 @@ def draw_status(
         f"Pessoas: {person_count}",
         f"Candidatos associados: {assigned_candidates}",
         f"Duplicatas de pessoa fundidas: {suppressed_duplicates}",
+        f"Trocas de tronco corrigidas: {corrected_torso_swaps}",
         f"L/R rejeitados para evitar X: {rejected_bilateral}",
         "Q ou ESC para sair",
     )
@@ -182,6 +184,7 @@ def main(args: argparse.Namespace | None = None) -> None:
                     assigned_candidates=report.assigned_candidates,
                     rejected_bilateral=report.rejected_bilateral_points,
                     suppressed_duplicates=report.suppressed_duplicate_people,
+                    corrected_torso_swaps=report.corrected_torso_swaps,
                 )
                 cv2.imshow(WINDOW_NAME, frame)
                 key = cv2.waitKey(1) & 0xFF
