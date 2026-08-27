@@ -27,6 +27,10 @@ WRIST_INDICES = (
     int(BodyKeypoint.LEFT_WRIST),
     int(BodyKeypoint.RIGHT_WRIST),
 )
+KNEE_INDICES = (
+    int(BodyKeypoint.LEFT_KNEE),
+    int(BodyKeypoint.RIGHT_KNEE),
+)
 ANKLE_INDICES = (
     int(BodyKeypoint.LEFT_ANKLE),
     int(BodyKeypoint.RIGHT_ANKLE),
@@ -39,6 +43,7 @@ def build_keypoint_weights(
     shoulder_weight: float = 1.25,
     elbow_weight: float = 1.75,
     wrist_weight: float = 2.50,
+    knee_weight: float = 1.75,
     ankle_weight: float = 3.00,
     device: torch.device | str | None = None,
     dtype: torch.dtype = torch.float32,
@@ -55,6 +60,7 @@ def build_keypoint_weights(
         ("shoulder_weight", shoulder_weight),
         ("elbow_weight", elbow_weight),
         ("wrist_weight", wrist_weight),
+        ("knee_weight", knee_weight),
         ("ankle_weight", ankle_weight),
     ):
         if value <= 0.0:
@@ -65,6 +71,7 @@ def build_keypoint_weights(
         (SHOULDER_INDICES, shoulder_weight),
         (ELBOW_INDICES, elbow_weight),
         (WRIST_INDICES, wrist_weight),
+        (KNEE_INDICES, knee_weight),
         (ANKLE_INDICES, ankle_weight),
     )
     for indices, weight in groups:
@@ -175,6 +182,7 @@ def total_v2_loss(
     shoulder_keypoint_weight: float = 1.25,
     elbow_keypoint_weight: float = 1.75,
     wrist_keypoint_weight: float = 2.50,
+    knee_keypoint_weight: float = 1.75,
     ankle_keypoint_weight: float = 3.00,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     joint_weights = build_keypoint_weights(
@@ -182,6 +190,7 @@ def total_v2_loss(
         shoulder_weight=shoulder_keypoint_weight,
         elbow_weight=elbow_keypoint_weight,
         wrist_weight=wrist_keypoint_weight,
+        knee_weight=knee_keypoint_weight,
         ankle_weight=ankle_keypoint_weight,
         device=output["keypoints"].device,
         dtype=output["keypoints"].dtype,
@@ -286,6 +295,7 @@ def train(args: argparse.Namespace) -> None:
         "shoulder_keypoint_weight",
         "elbow_keypoint_weight",
         "wrist_keypoint_weight",
+        "knee_keypoint_weight",
         "ankle_keypoint_weight",
     ):
         if getattr(args, name) <= 0.0:
@@ -311,6 +321,7 @@ def train(args: argparse.Namespace) -> None:
         f"ombro {args.shoulder_keypoint_weight:.2f} | "
         f"cotovelo {args.elbow_keypoint_weight:.2f} | "
         f"punho {args.wrist_keypoint_weight:.2f} | "
+        f"joelho {args.knee_keypoint_weight:.2f} | "
         f"tornozelo/pé {args.ankle_keypoint_weight:.2f}."
     )
 
@@ -353,6 +364,7 @@ def train(args: argparse.Namespace) -> None:
         "shoulder_keypoint_weight": args.shoulder_keypoint_weight,
         "elbow_keypoint_weight": args.elbow_keypoint_weight,
         "wrist_keypoint_weight": args.wrist_keypoint_weight,
+        "knee_keypoint_weight": args.knee_keypoint_weight,
         "ankle_keypoint_weight": args.ankle_keypoint_weight,
     }
 
@@ -385,6 +397,7 @@ def train(args: argparse.Namespace) -> None:
                     shoulder_keypoint_weight=args.shoulder_keypoint_weight,
                     elbow_keypoint_weight=args.elbow_keypoint_weight,
                     wrist_keypoint_weight=args.wrist_keypoint_weight,
+                    knee_keypoint_weight=args.knee_keypoint_weight,
                     ankle_keypoint_weight=args.ankle_keypoint_weight,
                 )
                 loss.backward()
@@ -480,6 +493,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--shoulder-keypoint-weight", type=float, default=1.25)
     parser.add_argument("--elbow-keypoint-weight", type=float, default=1.75)
     parser.add_argument("--wrist-keypoint-weight", type=float, default=2.50)
+    parser.add_argument("--knee-keypoint-weight", type=float, default=1.75)
     parser.add_argument("--ankle-keypoint-weight", type=float, default=3.00)
     parser.add_argument("--log-every", type=int, default=50)
     return parser.parse_args()
